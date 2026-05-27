@@ -69,11 +69,9 @@ export function ProgressDisplay({ status, onCancel }: Props) {
     const samplerActive = node === "sampler" && total > 0 && total <= 100;
 
     // Storybook macro-progress nodes
-    const storybookMatch = node?.match(/^page-(\d+)-(image|narrate|animate)$/);
-    const muxMatch = node?.match(/^mux-(\d+)$/);
+    const storybookMatch = node?.match(/^page-(\d+)-(image|animate)$/);
     const isStorybookNode =
-      node === "planning" || node === "stitching"
-      || !!storybookMatch || !!muxMatch;
+      node === "planning" || node === "stitching" || !!storybookMatch;
 
     let ratio: number;
     if (samplerActive) {
@@ -117,17 +115,12 @@ export function ProgressDisplay({ status, onCancel }: Props) {
     } else if (storybookMatch) {
       const pageNum = parseInt(storybookMatch[1], 10);
       const kind = storybookMatch[2];
-      // 3 phases per page (image + narrate + animate)
-      const totalPages = total > 0 ? Math.ceil(total / 3) : 0;
-      friendly =
-        kind === "image"   ? `Illustrating page ${pageNum}…` :
-        kind === "narrate" ? `Recording narration for page ${pageNum}…` :
-                             `Animating page ${pageNum}…`;
+      // 2 phases per page (image + animate)
+      const totalPages = total > 0 ? Math.ceil(total / 2) : 0;
+      friendly = kind === "image"
+        ? `Illustrating page ${pageNum}…`
+        : `Animating page ${pageNum}…`;
       if (totalPages) subtitle = `Page ${pageNum} of ${totalPages}`;
-    } else if (muxMatch) {
-      const idx = parseInt(muxMatch[1], 10);
-      friendly = "Adding the storyteller's voice…";
-      subtitle = `Page ${idx}`;
     } else {
       const labelMap: Record<string, string> = {
         model_loader: "Warming up the model…",

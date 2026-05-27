@@ -10,7 +10,7 @@ import {
 } from "react";
 import type {
   GenStatus, HistoryEntry,
-  ImageGenParams, UpscaleParams, StorybookParams,
+  ImageGenParams, StorybookParams,
 } from "../types";
 import { api } from "./api";
 import { loadProfile } from "./user";
@@ -43,7 +43,6 @@ interface Ctx {
   toggleTheme: () => void;
 
   generateImage: (params: ImageGenParams) => Promise<void>;
-  upscale: (params: UpscaleParams) => Promise<void>;
   generateStorybook: (params: StorybookParams) => Promise<void>;
   cancel: () => Promise<void>;
 }
@@ -204,23 +203,6 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const upscale = useCallback(async (p: UpscaleParams) => {
-    setLocalError(null);
-    if (!p.image) {
-      setLocalError("Please upload a photo first.");
-      return;
-    }
-    try {
-      const sub = await api.upscale(withProfile(p));
-      addMyPromptId(sub.prompt_id);
-      lastActivePromptIdRef.current = sub.prompt_id;
-      setResult(null);
-    } catch (e) {
-      const msg = (e as Error).message;
-      setLocalError(/409/.test(msg) ? "Someone is already making something. Wait a moment." : msg);
-    }
-  }, []);
-
   const deleteHistoryEntry = useCallback(
     async (id: string, hard = false) => {
       await api.deleteHistory(id, hard);
@@ -273,7 +255,6 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         theme,
         toggleTheme,
         generateImage,
-        upscale,
         generateStorybook,
         cancel,
       }}

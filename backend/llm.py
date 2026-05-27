@@ -66,8 +66,7 @@ _STORY_SYSTEM = (
     "      \"ending_pose\": \"<concise description of the character's body position + expression at the LAST frame of this scene. Same vocabulary style as starting_pose. This becomes the next scene's starting_pose.>\",\n"
     "      \"description\": \"<one-sentence visual description of the still image, MUST include the starting_pose so Flux paints the character in that exact pose. Composition, setting. Reference character by name.>\",\n"
     "      \"motion\": \"<short: what the character does. Must take character from starting_pose to ending_pose in one continuous arc.>\",\n"
-    "      \"video_prompt\": \"<DETAILED cinematic video direction (40-80 words). Must include: (1) shot framing (close-up / medium / wide / overhead), (2) lighting and mood, (3) motion arc starting from the starting_pose and finishing at the ending_pose with manner (slowly, gently, eagerly), (4) one sensory environmental detail (leaves drifting, steam rising, dust motes), (5) explicit closing pose. Smooth storybook-style motion. The motion completes by the prompt's end.>\",\n"
-    "      \"narration\": \"<two-to-three sentences of read-aloud narration. 25-45 words. Sensory detail, varied pacing, occasional dialogue/question/exclamation. Sounds like a warm, expressive parent reading aloud.>\"\n"
+    "      \"video_prompt\": \"<DETAILED cinematic video direction (40-80 words). Must include: (1) shot framing (close-up / medium / wide / overhead), (2) lighting and mood, (3) motion arc starting from the starting_pose and finishing at the ending_pose with manner (slowly, gently, eagerly), (4) one sensory environmental detail (leaves drifting, steam rising, dust motes), (5) explicit closing pose. Smooth storybook-style motion. The motion completes by the prompt's end.>\"\n"
     "    }\n"
     "  ]\n"
     "}\n\n"
@@ -76,9 +75,8 @@ _STORY_SYSTEM = (
     "1. CONTINUITY: scene[i].starting_pose MUST equal scene[i-1].ending_pose word-for-word. Plan all `ending_pose` and `starting_pose` first so they chain.\n"
     "2. The image (`description`) AND the video (`video_prompt`) must both reflect the starting_pose, so the first frame of the animation matches the previous page's last frame.\n"
     "3. Every video_prompt traverses from starting_pose to ending_pose — no mid-action cliffhangers.\n"
-    "4. Narration feels alive: vary length, add dialogue/exclamations, sensory pictures.\n"
-    "5. Each page ≈ 5 seconds of viewing; narration must fit at storyteller pace.\n"
-    "6. One primary action per scene. Child-friendly. Slow/subtle camera moves."
+    "4. Each page ≈ 3 seconds of silent visual motion.\n"
+    "5. One primary action per scene. Child-friendly. Slow/subtle camera moves."
 )
 
 
@@ -150,7 +148,7 @@ async def improve_prompt(short: str, style: Optional[str] = None) -> str:
 
 
 async def plan_storybook(story: str, n_pages: int, style: str) -> dict:
-    """Return {character, scenes:[{description, motion, narration}]} of length n_pages.
+    """Return {character, scenes:[{starting_pose, ending_pose, description, motion, video_prompt}]} of length n_pages.
 
     Retries once if the LLM returns fewer scenes than requested or any scene has empty fields.
     """
@@ -158,8 +156,8 @@ async def plan_storybook(story: str, n_pages: int, style: str) -> dict:
         f"Story idea: {story.strip()}\n\n"
         f"Number of scenes: EXACTLY {n_pages} (no more, no fewer)\n"
         f"Illustration style: {style}\n\n"
-        f"Every scene MUST include all SIX fields: starting_pose, ending_pose, description, "
-        f"motion, video_prompt, narration. The starting_pose of each scene (after scene 1) "
+        f"Every scene MUST include all FIVE fields: starting_pose, ending_pose, description, "
+        f"motion, video_prompt. The starting_pose of each scene (after scene 1) "
         f"MUST match the previous scene's ending_pose exactly. "
         f"Reference the character by name in every scene. Return STRICT JSON only."
     )
@@ -180,8 +178,6 @@ async def plan_storybook(story: str, n_pages: int, style: str) -> dict:
                 needs_retry = True; break
             if not (s.get("video_prompt") or "").strip():
                 needs_retry = True; break
-            if not (s.get("narration") or "").strip():
-                needs_retry = True; break
             if not (s.get("ending_pose") or "").strip():
                 needs_retry = True; break
 
@@ -190,20 +186,19 @@ async def plan_storybook(story: str, n_pages: int, style: str) -> dict:
         retry_user = user + (
             "\n\nIMPORTANT: your previous response was incomplete. "
             f"Output EXACTLY {n_pages} scenes. Every scene MUST have non-empty "
-            "`description`, `motion`, `video_prompt`, AND `narration` fields. Do not skip any field."
+            "`description`, `motion`, `video_prompt`, `starting_pose`, `ending_pose` fields. "
+            "Do not skip any field."
         )
         plan = await _request_plan(retry_user, n_pages, max_tokens=4096)
 
     plan["scenes"] = (plan.get("scenes") or [])[:n_pages]
     # Pad if still short — use the story as fallback so it's at least non-empty
     while len(plan["scenes"]) < n_pages:
-        idx = len(plan["scenes"]) + 1
         char = plan.get("character", "the character").split(",")[0]
         plan["scenes"].append({
             "description": f"Another moment in the story of {char}.",
             "motion": "gentle, subtle movement",
             "video_prompt": f"A soft, warm storybook scene featuring {char}. Slow, gentle motion. Cinematic lighting.",
-            "narration": story.strip()[:120] or "And the story continues...",
         })
     # Fill any individual empty fields
     fallback = {
@@ -212,7 +207,6 @@ async def plan_storybook(story: str, n_pages: int, style: str) -> dict:
         "description": "A quiet moment in the story.",
         "motion": "subtle motion",
         "video_prompt": "A soft warm storybook scene. Gentle, slow motion. Cinematic lighting that settles peacefully.",
-        "narration": "The story unfolds.",
     }
     for i, s in enumerate(plan["scenes"]):
         if not isinstance(s, dict):

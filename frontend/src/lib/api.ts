@@ -1,6 +1,6 @@
 import type {
   HistoryEntry,
-  ImageGenParams, UpscaleParams, StorybookParams,
+  ImageGenParams, StorybookParams,
 } from "../types";
 
 const BASE = "/api";
@@ -51,19 +51,6 @@ export const api = {
     }>(r);
   },
 
-  async upscale(params: UpscaleParams) {
-    const r = await fetch(`${BASE}/image_upscale`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(params),
-    });
-    return jsonOrThrow<{
-      prompt_id: string;
-      client_id: string;
-      gen_id: string;
-    }>(r);
-  },
-
   async storybook(params: StorybookParams) {
     const r = await fetch(`${BASE}/storybook`, {
       method: "POST",
@@ -90,6 +77,15 @@ export const api = {
     const fd = new FormData();
     fd.append("file", file);
     const r = await fetch(`${BASE}/upload`, { method: "POST", body: fd });
+    return jsonOrThrow<{ filename: string }>(r);
+  },
+
+  async useAsInput(filename: string) {
+    const r = await fetch(`${BASE}/use_as_input`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename }),
+    });
     return jsonOrThrow<{ filename: string }>(r);
   },
 

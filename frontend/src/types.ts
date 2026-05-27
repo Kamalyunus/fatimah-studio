@@ -24,11 +24,6 @@ export interface ImageGenParams {
   strength: number;  // for modify: 0.3 / 0.6 / 0.85
 }
 
-export interface UpscaleParams {
-  image: string;
-  factor: 2 | 4;
-}
-
 export interface StorybookParams {
   story: string;
   n_pages: number;

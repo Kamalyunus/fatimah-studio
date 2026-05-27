@@ -13,7 +13,7 @@ import { cn } from "./lib/utils";
 import { loadProfile, type UserProfile } from "./lib/user";
 
 type TopMode = "image" | "storybook";
-type ImageSubMode = "create" | "modify" | "enhance";
+type ImageSubMode = "create" | "modify";
 type View = "home" | "studio";
 
 function ModeTabs({ mode, onChange }: { mode: TopMode; onChange: (m: TopMode) => void }) {
@@ -71,8 +71,8 @@ function Studio() {
     const mode = loadedEntry.mode;
     if (kind === "image" || kind === "upscale" || mode === "create" || mode === "modify" || mode === "upscale") {
       setTopMode("image");
-      if (kind === "upscale" || mode === "upscale") setImageSubMode("enhance");
-      else if (mode === "modify") setImageSubMode("modify");
+      // Legacy "upscale" history entries route to Modify (closest remaining mode)
+      if (mode === "modify" || kind === "upscale" || mode === "upscale") setImageSubMode("modify");
       else setImageSubMode("create");
     } else {
       // storybook entries (or any other video output) → storybook tab
@@ -124,12 +124,11 @@ function Studio() {
             profile={profile ?? { name: "friend", emoji: "🌸" }}
             onPickImageCreate={() => onPickImage("create")}
             onPickImageModify={() => onPickImage("modify")}
-            onPickImageEnhance={() => onPickImage("enhance")}
             onPickStorybook={() => { setTopMode("storybook"); setView("studio"); }}
           />
         </main>
       ) : (
-        <main className="flex-1 max-w-[1400px] w-full mx-auto px-4 sm:px-6 py-6 grid grid-cols-1 lg:grid-cols-[440px_minmax(0,1fr)] gap-6">
+        <main className="flex-1 w-full max-w-[1920px] mx-auto px-4 sm:px-6 py-6 grid grid-cols-1 lg:grid-cols-[420px_minmax(0,1fr)] xl:grid-cols-[520px_minmax(0,1fr)] 2xl:grid-cols-[620px_minmax(0,1fr)] gap-6">
           <section className="lg:max-h-[calc(100vh-104px)] lg:overflow-y-auto lg:pr-2 lg:sticky lg:top-20">
             <ModeTabs mode={topMode} onChange={setTopMode} />
             {topMode === "image" ? (

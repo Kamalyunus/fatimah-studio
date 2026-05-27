@@ -19,12 +19,6 @@ export const IMAGE_DIMS: Record<Aspect, { width: number; height: number }> = {
   portrait:  { width: 768,  height: 1280 },
 };
 
-export const IMAGE_STRENGTHS = [
-  { key: "subtle",   label: "Subtle",   hint: "Small tweaks",      value: 0.35 },
-  { key: "moderate", label: "Moderate", hint: "Noticeable change", value: 0.6 },
-  { key: "bold",     label: "Bold",     hint: "Reimagine it",      value: 0.85 },
-];
-
 // Style chips. The `key` is sent to the backend LLM; the label is what the user sees.
 export const IMAGE_STYLE_CHIPS = [
   { key: "cinematic",     label: "Cinematic" },

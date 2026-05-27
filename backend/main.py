@@ -1,7 +1,7 @@
 """Fatimah Studio backend — FastAPI relay over ComfyUI.
 
 Exposes a clean REST + WebSocket API for the React frontend:
-  POST /api/storybook          plan + illustrate + animate + narrate a storybook
+  POST /api/storybook          plan + illustrate + animate a storybook
   POST /api/image_generate     Flux/SDXL text-to-image (or image-to-image)
   POST /api/image_upscale      4x-UltraSharp upscale
   POST /api/llm/improve        rewrite a short prompt into a richer one
@@ -36,7 +36,6 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 import llm
-import tts
 
 # ---------- Config ----------
 
@@ -442,6 +441,35 @@ def build_flux_kontext_workflow(prompt: str, width: int, height: int, seed: int,
     }
 
 
+def _append_upscale(wf: dict, image_ref: list, save_prefix: str, factor: int = 2) -> dict:
+    """Chain a 4x-UltraSharp upscale onto an existing image workflow. Drops the upstream
+    save node (if any) and writes a fresh one pointing at the upscaled output.
+
+    factor=4 keeps the raw 4x output; factor=2 lanczos-downscales it (4x dims → 2x dims).
+    """
+    wf.pop("save", None)
+    wf["upscale_model"] = {
+        "class_type": "UpscaleModelLoader",
+        "inputs": {"model_name": UPSCALER_MODEL},
+    }
+    wf["upscale"] = {
+        "class_type": "ImageUpscaleWithModel",
+        "inputs": {"upscale_model": ["upscale_model", 0], "image": image_ref},
+    }
+    final_ref = ["upscale", 0]
+    if factor == 2:
+        wf["scale_down"] = {
+            "class_type": "ImageScaleBy",
+            "inputs": {"image": ["upscale", 0], "upscale_method": "lanczos", "scale_by": 0.5},
+        }
+        final_ref = ["scale_down", 0]
+    wf["save"] = {
+        "class_type": "SaveImage",
+        "inputs": {"images": final_ref, "filename_prefix": save_prefix},
+    }
+    return wf
+
+
 def build_flux_image_workflow(p: "ImageGenerateParams") -> dict:
     """Flux.1 [schnell] text-to-image (or image-to-image when p.image is set)."""
     is_i2i = p.image_mode == "modify" and p.image
@@ -517,12 +545,11 @@ def build_flux_image_workflow(p: "ImageGenerateParams") -> dict:
         "class_type": "VAEDecode",
         "inputs": {"samples": ["sampler", 0], "vae": ["vae", 0]},
     }
+    if p.auto_upscale:
+        return _append_upscale(wf, ["decode", 0], "wan_studio_image_flux", factor=2)
     wf["save"] = {
         "class_type": "SaveImage",
-        "inputs": {
-            "images": ["decode", 0],
-            "filename_prefix": "wan_studio_image_flux",
-        },
+        "inputs": {"images": ["decode", 0], "filename_prefix": "wan_studio_image_flux"},
     }
     return wf
 
@@ -592,12 +619,11 @@ def build_sdxl_image_workflow(p: "ImageGenerateParams") -> dict:
         "class_type": "VAEDecode",
         "inputs": {"samples": ["sampler", 0], "vae": ["checkpoint", 2]},
     }
+    if p.auto_upscale:
+        return _append_upscale(wf, ["decode", 0], "wan_studio_image_sdxl", factor=2)
     wf["save"] = {
         "class_type": "SaveImage",
-        "inputs": {
-            "images": ["decode", 0],
-            "filename_prefix": "wan_studio_image_sdxl",
-        },
+        "inputs": {"images": ["decode", 0], "filename_prefix": "wan_studio_image_sdxl"},
     }
     return wf
 
@@ -693,6 +719,10 @@ class ImageGenerateParams(BaseModel):
     model: str = Field("flux", pattern="^(flux|sdxl)$")
     image: str = ""  # filename inside ComfyUI's input/ — used for modify
     strength: float = 0.6  # for modify: 0=unchanged, 1=fully regenerated. 0.3=subtle, 0.6=moderate, 0.85=bold
+    # When true, chain a 2x UltraSharp upscale onto the workflow before saving.
+    # Set by /api/image_generate so every user Create/Modify is auto-enhanced;
+    # left False for the storybook page generator (those are already pre-sized for Wan).
+    auto_upscale: bool = False
 
 
 class UpscaleParams(BaseModel):
@@ -1008,6 +1038,20 @@ def _generate_thumb(video_path: Path, thumb_path: Path) -> bool:
 
 # ---------- Routes ----------
 
+async def _comfy_free() -> None:
+    """Tell ComfyUI to release cached models and free VRAM. Symmetric with llm.unload():
+    diffusion endpoints unload the LLM before queueing; LLM endpoints should ask ComfyUI
+    to free its cached models before invoking Ollama, so the (~23 GB) LLM can actually load."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.post(
+                f"{COMFY_HTTP}/free",
+                json={"unload_models": True, "free_memory": True},
+            )
+    except Exception:
+        pass  # don't fail the caller if ComfyUI is briefly unreachable
+
+
 @app.get("/api/health")
 async def health():
     try:
@@ -1029,6 +1073,24 @@ async def upload(file: UploadFile = File(...)):
     return {"filename": name}
 
 
+class UseAsInputParams(BaseModel):
+    filename: str   # filename in COMFY_OUTPUT to copy into COMFY_INPUT for re-use
+
+
+@app.post("/api/use_as_input")
+async def use_as_input(p: UseAsInputParams):
+    """Copy a previously generated output image into ComfyUI's input/ folder so it can
+    be referenced by a follow-up modify/i2i workflow without a full upload round-trip."""
+    src = COMFY_OUTPUT / p.filename
+    if not src.exists() or not src.is_file():
+        raise HTTPException(404, "source file not found in output")
+    COMFY_INPUT.mkdir(exist_ok=True)
+    ext = src.suffix or ".png"
+    name = f"iterate_{uuid.uuid4().hex[:8]}{ext}"
+    shutil.copyfile(str(src), str(COMFY_INPUT / name))
+    return {"filename": name}
+
+
 @app.post("/api/image_generate")
 async def image_generate(params: ImageGenerateParams):
     """Text-to-image OR image-to-image (modify) using Flux schnell or SDXL Lightning."""
@@ -1042,6 +1104,10 @@ async def image_generate(params: ImageGenerateParams):
             raise HTTPException(409, "Someone is already making something. Wait a moment.")
         if params.image_mode == "modify" and not params.image:
             raise HTTPException(400, "Modify mode needs an uploaded image")
+
+        # User-facing image gen always auto-upscales 2x; storybook page gen doesn't (the
+        # storybook orchestrator builds ImageGenerateParams directly without this flag).
+        params.auto_upscale = True
 
         if params.model == "sdxl":
             workflow = build_sdxl_image_workflow(params)
@@ -1245,99 +1311,18 @@ def _build_transition_workflow(img_a_name: str, img_b_name: str, prefix: str, mu
     }
 
 
-async def _ffprobe_duration(path: str) -> float:
-    proc = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    out, _ = await proc.communicate()
-    try:
-        return float(out.decode().strip())
-    except Exception:
-        return 0.0
-
-
-async def _mux_scene_with_audio(video_path: str, audio_path: Optional[str], out_path: str, min_hold: float = 1.5):
-    """Combine a Wan clip with a narration WAV. Pad video (clone last frame) and audio (silence)
-    so they end together. Total duration = max(video+min_hold, audio+0.5s breathing room)."""
-    video_dur = await _ffprobe_duration(video_path)
-    audio_dur = (await _ffprobe_duration(audio_path)) if audio_path else 0.0
-    total = max(video_dur + min_hold, audio_dur + 0.5, video_dur + 0.1)
-    v_pad = max(0.0, total - video_dur)
-    a_pad = max(0.0, total - audio_dur)
-
-    if audio_path and audio_dur > 0:
-        filter_str = (
-            f"[0:v]tpad=stop_mode=clone:stop_duration={v_pad:.3f}[v];"
-            f"[1:a]apad=pad_dur={a_pad:.3f}[a]"
-        )
-        args = [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-i", audio_path,
-            "-filter_complex", filter_str,
-            "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast",
-            "-c:a", "aac", "-b:a", "128k",
-            out_path,
-        ]
-    else:
-        args = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vf", f"tpad=stop_mode=clone:stop_duration={v_pad:.3f}",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast",
-            out_path,
-        ]
-    proc = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"mux scene failed: {stderr.decode()[:400]}")
-
-
-async def _has_audio(video_path: str) -> bool:
-    proc = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type",
-        "-of", "default=noprint_wrappers=1:nokey=1", video_path,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-    )
-    out, _ = await proc.communicate()
-    return b"audio" in (out or b"")
-
-
-async def _stitch_videos(paths: list[str], output_path: str, hold_dur: float = 0.0, **_ignored):
-    """Plain hard-cut concat. Inputs may carry audio (will be preserved).
-    If hold_dur > 0, last frame of each clip is also tpad-extended.
-    For the storybook with audio, hold is baked into each scene segment so hold_dur=0 here."""
+async def _stitch_videos(paths: list[str], output_path: str, hold_dur: float = 0.0):
+    """Hard-cut concat of silent video clips. If hold_dur > 0, the last frame of each
+    clip is tpad-extended before the cut (page-turn beat). Storybook uses hold_dur=0
+    because byte-perfect FLF2V chaining already makes the cuts invisible."""
     if not paths:
         raise ValueError("no paths to stitch")
 
-    has_audio = await _has_audio(paths[0])
-
-    if len(paths) == 1 and hold_dur <= 0 and has_audio:
-        # Just transcode-copy (or remux). Keep audio.
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", paths[0],
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart", output_path,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed: {stderr.decode()[:300]}")
-        return
-
-    # Build filter_complex
     args: list[str] = ["ffmpeg", "-y"]
     for p in paths:
         args.extend(["-i", p])
     parts: list[str] = []
     v_labels: list[str] = []
-    a_labels: list[str] = []
     for i in range(len(paths)):
         v = f"v{i}"
         v_labels.append(f"[{v}]")
@@ -1345,24 +1330,14 @@ async def _stitch_videos(paths: list[str], output_path: str, hold_dur: float = 0
             parts.append(f"[{i}:v]tpad=stop_mode=clone:stop_duration={hold_dur:.3f}[{v}]")
         else:
             parts.append(f"[{i}:v]copy[{v}]")
-        if has_audio:
-            a_labels.append(f"[{i}:a]")
-    if has_audio:
-        chains = "".join(f"{v_labels[i]}{a_labels[i]}" for i in range(len(paths)))
-        parts.append(f"{chains}concat=n={len(paths)}:v=1:a=1[outv][outa]")
-        maps = ["-map", "[outv]", "-map", "[outa]"]
-    else:
-        parts.append(f"{''.join(v_labels)}concat=n={len(paths)}:v=1:a=0[outv]")
-        maps = ["-map", "[outv]"]
+    parts.append(f"{''.join(v_labels)}concat=n={len(paths)}:v=1:a=0[outv]")
 
     args.extend([
         "-filter_complex", ";".join(parts),
-        *maps,
+        "-map", "[outv]",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast",
+        "-movflags", "+faststart", output_path,
     ])
-    if has_audio:
-        args.extend(["-c:a", "aac", "-b:a", "128k"])
-    args.extend(["-movflags", "+faststart", output_path])
 
     proc = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
@@ -1378,6 +1353,10 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
     try:
         if _active_gen is not None:
             _active_gen.node = "planning"
+
+        # Free any ComfyUI-cached models (Flux from a recent image gen, etc.) so the
+        # planner LLM can load without contending for GPU memory.
+        await _comfy_free()
 
         # 1) Use the LLM to plan
         plan = await llm.plan_storybook(p.story, p.n_pages, p.style)
@@ -1401,16 +1380,10 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         seed = int(time.time()) % (2**31)
 
         page_videos: list[str] = []
-        # Per-page narration: (audio_path_or_None, duration_seconds). Narration is
-        # synthesised BEFORE Wan animation so we can pick Wan's frame count to fit it.
-        page_narration: list[tuple[Optional[str], float]] = []
         prev_image: Optional[str] = None
-        # Phases per page: image, narrate, animate (animate is the heavy one)
-        total = len(scenes) * 3
+        # Phases per page: image, animate
+        total = len(scenes) * 2
         step_done = 0
-
-        narration_dir = COMFY_OUTPUT / f"_storybook_narr_{gen_id}"
-        narration_dir.mkdir(exist_ok=True)
 
         for i, scene in enumerate(scenes):
             scene_desc = scene.get("description") or "A scene from the story."
@@ -1475,33 +1448,10 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
             prev_image = end_out
             step_done += 1
 
-            # ---- Narrate first so we can size the Wan clip to fit the audio ----
-            if _active_gen is not None:
-                _active_gen.node = f"page-{i+1}-narrate"
-                _active_gen.step = step_done
-
-            narration_text = (scene.get("narration") or "").strip()
-            audio_path_obj = narration_dir / f"page_{i}.wav"
-            audio_path: Optional[str] = None
-            audio_dur = 0.0
-            if narration_text:
-                try:
-                    await tts.synthesize_to_file(narration_text, audio_path_obj)
-                    audio_dur = await _ffprobe_duration(str(audio_path_obj))
-                    audio_path = str(audio_path_obj)
-                except Exception as e:
-                    print(f"[storybook] TTS failed for page {i+1}: {e}")
-            page_narration.append((audio_path, audio_dur))
-            step_done += 1
-
             # ---- Animate (Wan 2.2 FLF2V: start + end frame conditioning) ----
-            # Pick from Wan's two trained sweet spots (49 or 81 frames) so the video
-            # covers the narration without a long freeze. 49 @ 16fps = 3.06s, 81 = 5.06s.
-            # We leave ≥0.5s of natural beat after the audio ends.
-            if audio_dur > (49 / 16) - 0.5:   # > 2.56s of narration → bump to 81 frames
-                frames = 81
-            else:
-                frames = 49
+            # Fixed 49 frames @ 16 fps = ~3 s per page. Wan's trained sweet spot for
+            # storybook pacing; tail-hold added at stitch time for the "page turn" beat.
+            frames = 49
 
             if _active_gen is not None:
                 _active_gen.node = f"page-{i+1}-animate"
@@ -1544,28 +1494,9 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
             page_videos.append(str(COMFY_OUTPUT / vid_filename))
             step_done += 1
 
-        # --- Mux each page's Wan clip with its already-synthesised narration ---
-        scene_segments: list[str] = []
-        for i, (audio_path, _audio_dur) in enumerate(page_narration):
-            if _active_gen is not None:
-                _active_gen.node = f"mux-{i + 1}"
-            seg_path = narration_dir / f"scene_{i}.mp4"
-            try:
-                # Tight floor (0.5s) — frame count is already sized to the narration,
-                # so we only need a small natural beat at the end of each page.
-                await _mux_scene_with_audio(
-                    page_videos[i],
-                    audio_path,
-                    str(seg_path),
-                    min_hold=0.5,
-                )
-                scene_segments.append(str(seg_path))
-            except Exception as e:
-                print(f"[storybook] mux page {i+1} failed: {e}")
-                # fall back: use the raw Wan clip (no audio, no hold)
-                scene_segments.append(page_videos[i])
-
-        # --- Final stitch (audio carries through) ---
+        # --- Final stitch: hard-cut concat of raw Wan clips. ---
+        # Because each page's start frame is a byte-perfect copy of the previous page's
+        # end frame, the cuts are invisible and the result reads as one continuous shot.
         if _active_gen is not None:
             _active_gen.node = "stitching"
             _active_gen.step = total
@@ -1573,7 +1504,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
 
         final_filename = f"wan_studio_storybook_{gen_id}.mp4"
         final_path = COMFY_OUTPUT / final_filename
-        await _stitch_videos(scene_segments, str(final_path), hold_dur=0.0)
+        await _stitch_videos(page_videos, str(final_path), hold_dur=0.0)
 
         # Save to history
         items = _load_json(HISTORY_FILE, [])
@@ -1636,6 +1567,8 @@ async def storybook(p: StorybookParams):
 async def llm_improve(p: ImprovePromptParams):
     if not await llm.is_available():
         raise HTTPException(503, "Local LLM not available")
+    # Free ComfyUI's cached models so the (~23 GB) qwen3.6 can actually load on GPU.
+    await _comfy_free()
     try:
         out = await llm.improve_prompt(p.prompt, style=p.style or None)
     except Exception as e:

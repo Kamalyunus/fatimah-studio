@@ -1,4 +1,4 @@
-import { Image as ImageIcon, Maximize, Pencil, BookOpen } from "lucide-react";
+import { Image as ImageIcon, Pencil, BookOpen } from "lucide-react";
 import { useStudio } from "../lib/store";
 import type { UserProfile } from "../lib/user";
 import { cn } from "../lib/utils";
@@ -7,12 +7,11 @@ interface Props {
   profile: UserProfile;
   onPickImageCreate: () => void;
   onPickImageModify: () => void;
-  onPickImageEnhance: () => void;
   onPickStorybook: () => void;
 }
 
 export function HomeScreen({
-  profile, onPickImageCreate, onPickImageModify, onPickImageEnhance, onPickStorybook,
+  profile, onPickImageCreate, onPickImageModify, onPickStorybook,
 }: Props) {
   const { history } = useStudio();
 
@@ -54,7 +53,7 @@ export function HomeScreen({
         </div>
       </button>
 
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 max-w-5xl mx-auto">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-3xl mx-auto">
         <BigCard
           icon={ImageIcon}
           emoji="🖼️"
@@ -70,14 +69,6 @@ export function HomeScreen({
           subtitle="Upload a photo, describe your edit"
           accent="from-sky-400 to-cyan-400"
           onClick={onPickImageModify}
-        />
-        <BigCard
-          icon={Maximize}
-          emoji="🔍"
-          title="Enhance a photo"
-          subtitle="Make small photos bigger and sharper"
-          accent="from-emerald-400 to-teal-400"
-          onClick={onPickImageEnhance}
         />
       </div>
 
