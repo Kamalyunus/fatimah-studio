@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+
+# Frontend
+node_modules/
+dist/
+.vite/
+
+# Generated state — local to each install
+backend/history.json
+backend/presets.json
+backend/thumbs/
+backend/__pycache__/
+
+# Logs + tmp
+*.log
+*.tmp
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Env
+.env
+.env.local
