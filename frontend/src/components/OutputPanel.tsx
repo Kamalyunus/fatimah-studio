@@ -34,7 +34,7 @@ export function OutputPanel() {
     status.phase === "running" ? status.character : undefined;
   const totalPages =
     status.phase === "running" && status.totalSteps
-      ? Math.ceil(status.totalSteps / 2)
+      ? Math.ceil(status.totalSteps / 3)
       : 0;
 
   // Fire confetti on phase transition to "done"

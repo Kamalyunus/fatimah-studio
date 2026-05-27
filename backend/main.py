@@ -715,6 +715,7 @@ class StorybookParams(BaseModel):
 
 class ImprovePromptParams(BaseModel):
     prompt: str
+    style: str = ""   # optional chip label, e.g. "cinematic" — lets the LLM apply a visual style
 
 
 class HistoryEntry(BaseModel):
@@ -1400,9 +1401,16 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         seed = int(time.time()) % (2**31)
 
         page_videos: list[str] = []
+        # Per-page narration: (audio_path_or_None, duration_seconds). Narration is
+        # synthesised BEFORE Wan animation so we can pick Wan's frame count to fit it.
+        page_narration: list[tuple[Optional[str], float]] = []
         prev_image: Optional[str] = None
-        total = len(scenes) * 2  # image + video per page
+        # Phases per page: image, narrate, animate (animate is the heavy one)
+        total = len(scenes) * 3
         step_done = 0
+
+        narration_dir = COMFY_OUTPUT / f"_storybook_narr_{gen_id}"
+        narration_dir.mkdir(exist_ok=True)
 
         for i, scene in enumerate(scenes):
             scene_desc = scene.get("description") or "A scene from the story."
@@ -1467,7 +1475,34 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
             prev_image = end_out
             step_done += 1
 
+            # ---- Narrate first so we can size the Wan clip to fit the audio ----
+            if _active_gen is not None:
+                _active_gen.node = f"page-{i+1}-narrate"
+                _active_gen.step = step_done
+
+            narration_text = (scene.get("narration") or "").strip()
+            audio_path_obj = narration_dir / f"page_{i}.wav"
+            audio_path: Optional[str] = None
+            audio_dur = 0.0
+            if narration_text:
+                try:
+                    await tts.synthesize_to_file(narration_text, audio_path_obj)
+                    audio_dur = await _ffprobe_duration(str(audio_path_obj))
+                    audio_path = str(audio_path_obj)
+                except Exception as e:
+                    print(f"[storybook] TTS failed for page {i+1}: {e}")
+            page_narration.append((audio_path, audio_dur))
+            step_done += 1
+
             # ---- Animate (Wan 2.2 FLF2V: start + end frame conditioning) ----
+            # Pick from Wan's two trained sweet spots (49 or 81 frames) so the video
+            # covers the narration without a long freeze. 49 @ 16fps = 3.06s, 81 = 5.06s.
+            # We leave ≥0.5s of natural beat after the audio ends.
+            if audio_dur > (49 / 16) - 0.5:   # > 2.56s of narration → bump to 81 frames
+                frames = 81
+            else:
+                frames = 49
+
             if _active_gen is not None:
                 _active_gen.node = f"page-{i+1}-animate"
                 _active_gen.step = step_done
@@ -1488,7 +1523,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 prompt=wan_full_prompt,
                 negative=DEFAULT_NEGATIVE,
                 width=width, height=height,
-                frames=49, steps=20,
+                frames=frames, steps=20,
                 cfg=6.0, shift=5.0, seed=seed,
                 fps=16, scheduler="unipc",
                 noise_aug=0.0,
@@ -1502,41 +1537,27 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 interpolate=False,
                 use_slg=True, use_feta=True, use_teacache=True,
             )
-            # Wan 2.2 14B MoE — much better face fidelity than 2.1 for storybook
+            # 81-frame jobs take ~65% longer than 49 — bump timeout proportionally
+            wan_timeout = 1500 if frames == 49 else 2400
             wf_v = build_wan22_i2v_workflow(i2v_params)
-            vid_filename = await _submit_comfy_and_wait(wf_v, timeout_s=1500)
+            vid_filename = await _submit_comfy_and_wait(wf_v, timeout_s=wan_timeout)
             page_videos.append(str(COMFY_OUTPUT / vid_filename))
             step_done += 1
 
-        # --- Generate narration audio per scene + mux into per-scene segments ---
+        # --- Mux each page's Wan clip with its already-synthesised narration ---
         scene_segments: list[str] = []
-        if _active_gen is not None:
-            _active_gen.node = "narrating"
-        narration_dir = COMFY_OUTPUT / f"_storybook_narr_{gen_id}"
-        narration_dir.mkdir(exist_ok=True)
-
-        for i, scene in enumerate(scenes):
+        for i, (audio_path, _audio_dur) in enumerate(page_narration):
             if _active_gen is not None:
-                _active_gen.node = f"narration-{i + 1}"
-            narration_text = (scene.get("narration") or "").strip()
-            audio_path = narration_dir / f"page_{i}.wav"
-            try:
-                if narration_text:
-                    await tts.synthesize_to_file(narration_text, audio_path)
-                else:
-                    audio_path = None  # type: ignore
-            except Exception as e:
-                print(f"[storybook] TTS failed for page {i+1}: {e}")
-                audio_path = None  # type: ignore
-
-            # Mux the page's Wan clip with its narration audio + a tail-hold
+                _active_gen.node = f"mux-{i + 1}"
             seg_path = narration_dir / f"scene_{i}.mp4"
             try:
+                # Tight floor (0.5s) — frame count is already sized to the narration,
+                # so we only need a small natural beat at the end of each page.
                 await _mux_scene_with_audio(
                     page_videos[i],
-                    str(audio_path) if audio_path else None,
+                    audio_path,
                     str(seg_path),
-                    min_hold=1.0,
+                    min_hold=0.5,
                 )
                 scene_segments.append(str(seg_path))
             except Exception as e:
@@ -1616,7 +1637,7 @@ async def llm_improve(p: ImprovePromptParams):
     if not await llm.is_available():
         raise HTTPException(503, "Local LLM not available")
     try:
-        out = await llm.improve_prompt(p.prompt)
+        out = await llm.improve_prompt(p.prompt, style=p.style or None)
     except Exception as e:
         raise HTTPException(502, f"LLM call failed: {e}")
     return {"prompt": out}

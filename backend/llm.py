@@ -5,19 +5,52 @@ from typing import Any, Optional
 import httpx
 
 OLLAMA_URL = "http://127.0.0.1:11434"
-# Two models picked per task:
-#  - qwen3:8b for "Improve prompt" UI button (fast cold-load, snappy UX)
-#  - qwen3.6:latest (23 GB) for storybook planning where reasoning quality matters
-#    (LLM unloads from VRAM before Wan starts, so size doesn't contend)
-LLM_MODEL = "qwen3:8b"
-LLM_MODEL_JSON = "qwen3.6:latest"
+# Single LLM for everything (prompt rewriting + storybook planning). qwen3.6 is heavier
+# but writes noticeably better prompts; the LLM unloads from VRAM before diffusion so
+# the size doesn't fight Wan/Flux at gen time.
+LLM_MODEL = "qwen3.6:latest"
 
 _IMPROVE_SYSTEM = (
-    "You are a prompt engineer for AI image and video generators. "
-    "Given a short user prompt, rewrite it as a single rich descriptive sentence (under 60 words) "
-    "with concrete visual details: lighting, camera angle, mood, setting. "
-    "Do NOT include text in quotes, do NOT add commentary — just the rewritten prompt itself."
+    "You are a senior prompt engineer for AI image generators (Flux, SDXL). "
+    "Your job: take a short user idea and rewrite it as a single comprehensive prompt "
+    "(70-90 words, one sentence preferred) that a diffusion model can render faithfully.\n\n"
+    "Include, in roughly this order:\n"
+    "  1. SUBJECT — concrete specifics: who/what, age/breed/material, distinguishing features, "
+    "expression or posture, clothing/texture.\n"
+    "  2. SETTING — where it is, time of day or season, two sensory environmental details "
+    "(e.g. drifting pollen, wet cobblestones, neon haze).\n"
+    "  3. COMPOSITION — shot framing (close-up / medium / wide / overhead), camera angle, "
+    "and where the subject sits in frame.\n"
+    "  4. LIGHTING — direction and quality (golden hour back-lighting, soft north window, "
+    "harsh noon, etc.). Lighting drives mood; be specific.\n"
+    "  5. ATMOSPHERE — one short mood phrase (serene, melancholic, electric, intimate).\n"
+    "  6. TECHNICAL FINISH — sharpness / detail level / depth of field, plus a color palette cue.\n\n"
+    "Rules:\n"
+    "  - Preserve every concrete detail the user gave; never drop or contradict them.\n"
+    "  - Use vivid concrete nouns; avoid generic adjectives like 'beautiful', 'amazing', 'epic'.\n"
+    "  - No quotes around the output, no preamble, no bullet points, no commentary — just the "
+    "    rewritten prompt itself, ready to feed to a diffusion model."
 )
+
+# Style guidance — applied on top of _IMPROVE_SYSTEM when the user picks a style chip.
+# Keys are the lowercase labels the frontend sends.
+_STYLE_HINTS = {
+    "cinematic":
+        "Style: CINEMATIC. Frame it as a film still — dramatic lighting, anamorphic feel, "
+        "shallow depth of field, slight film grain. Lean into mood and atmosphere.",
+    "photorealistic":
+        "Style: PHOTOREALISTIC. Frame it as professional photography — sharp focus, high "
+        "dynamic range, natural lighting, accurate colors, fine surface detail.",
+    "anime":
+        "Style: ANIME. Frame it in the style of Studio Ghibli / classic Japanese animation — "
+        "hand-painted backgrounds, vibrant colors, soft cel shading, gentle mood.",
+    "painting":
+        "Style: OIL PAINTING. Frame it as a traditional oil painting — visible brushstrokes, "
+        "rich pigments, painterly texture, classical composition.",
+    "pencil sketch":
+        "Style: PENCIL SKETCH. Frame it as a detailed graphite drawing — careful hatching, "
+        "tonal shading, paper texture, monochrome.",
+}
 
 _STORY_SYSTEM = (
     "You are a children's book editor and storyboard cinematographer. You will receive a "
@@ -49,16 +82,12 @@ _STORY_SYSTEM = (
 )
 
 
-async def _chat(system: str, user: str, json_mode: bool = False, timeout: float = 120.0, max_tokens: int = 2048, model: Optional[str] = None) -> str:
-    """Call ollama /api/chat with a system + user message; return assistant content.
-
-    `model` defaults to LLM_MODEL (qwen3:8b for prose). Pass LLM_MODEL_JSON for structured output.
-    """
-    model_name = model or LLM_MODEL
-    is_qwen3 = "qwen3" in model_name.lower()
+async def _chat(system: str, user: str, json_mode: bool = False, timeout: float = 120.0, max_tokens: int = 2048) -> str:
+    """Call ollama /api/chat with a system + user message; return assistant content."""
+    is_qwen3 = "qwen3" in LLM_MODEL.lower()
     sys_full = f"{system.rstrip()} /no_think" if is_qwen3 else system
     payload: dict[str, Any] = {
-        "model": model_name,
+        "model": LLM_MODEL,
         "stream": False,
         "keep_alive": 0,
         "messages": [
@@ -82,26 +111,39 @@ async def _chat(system: str, user: str, json_mode: bool = False, timeout: float 
 
 
 async def unload() -> None:
-    """Force-unload any loaded LLM from VRAM. Safe to call when nothing is loaded."""
+    """Force-unload every currently loaded model from VRAM. Safe to call when nothing is loaded.
+
+    Uses /api/chat with keep_alive:0 — /api/generate was observed to not reliably evict
+    qwen3.6 on this setup. We also walk /api/ps so a leftover model from a different
+    name (e.g. an older small model) still gets cleared instead of holding 20+ GB.
+    """
     try:
-        async with httpx.AsyncClient(timeout=5) as c:
-            await c.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={"model": LLM_MODEL, "keep_alive": 0},
-            )
+        async with httpx.AsyncClient(timeout=10) as c:
+            ps = await c.get(f"{OLLAMA_URL}/api/ps")
+            loaded = [m.get("name") for m in (ps.json().get("models") or []) if m.get("name")]
+            # Always include the configured model — covers the case where /api/ps is empty
+            # but a stale instance is still resident.
+            for name in set(loaded + [LLM_MODEL]):
+                await c.post(
+                    f"{OLLAMA_URL}/api/chat",
+                    json={"model": name, "messages": [], "keep_alive": 0},
+                )
     except Exception:
         pass  # don't fail the caller if ollama is down
 
 
-async def improve_prompt(short: str) -> str:
-    """Take a short user prompt and rewrite it as a richer one."""
+async def improve_prompt(short: str, style: Optional[str] = None) -> str:
+    """Rewrite a short user prompt into a richer one. If `style` matches a known
+    chip (e.g. "cinematic"), the LLM is also nudged to lean into that visual style."""
     short = short.strip()
     if not short:
         return short
-    out = await _chat(_IMPROVE_SYSTEM, short)
-    # Trim quotes / common artefacts
+    system = _IMPROVE_SYSTEM
+    hint = _STYLE_HINTS.get((style or "").strip().lower())
+    if hint:
+        system = f"{_IMPROVE_SYSTEM}\n\n{hint}"
+    out = await _chat(system, short)
     out = out.strip().strip("\"'")
-    # Sanity fallback: if LLM returned something tiny, keep original
     if len(out) < len(short) * 0.7:
         return short
     return out
@@ -191,7 +233,7 @@ async def plan_storybook(story: str, n_pages: int, style: str) -> dict:
 
 async def _request_plan(user: str, n_pages: int, max_tokens: int) -> dict:
     # Use the JSON-tuned model (qwen2.5:3b) for structured output
-    raw = await _chat(_STORY_SYSTEM, user, json_mode=True, timeout=180.0, max_tokens=max_tokens, model=LLM_MODEL_JSON)
+    raw = await _chat(_STORY_SYSTEM, user, json_mode=True, timeout=180.0, max_tokens=max_tokens)
     try:
         plan = json.loads(raw)
     except json.JSONDecodeError:

@@ -73,11 +73,11 @@ export const api = {
     return jsonOrThrow<{ prompt_id: string; gen_id: string; kind: string }>(r);
   },
 
-  async improvePrompt(prompt: string) {
+  async improvePrompt(prompt: string, style?: string) {
     const r = await fetch(`${BASE}/llm/improve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, style: style ?? "" }),
     });
     return jsonOrThrow<{ prompt: string }>(r);
   },

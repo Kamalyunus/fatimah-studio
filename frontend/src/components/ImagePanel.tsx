@@ -77,18 +77,29 @@ export function ImagePanel({ initialMode = "create" }: { initialMode?: ImageMode
     }
   };
 
-  const appendStyle = (snippet: string) =>
-    setPrompt((p) => (p.trim() ? `${p.trim()}, ${snippet}` : snippet));
-
   const [improving, setImproving] = useState(false);
+  // null = nothing pending; otherwise the style key currently being applied.
+  // We track which chip (or "improve") is in flight so the UI can show a per-button spinner.
+  const [pendingStyle, setPendingStyle] = useState<string | null>(null);
+
   const improvePrompt = async () => {
-    if (improving || !prompt.trim()) return;
+    if (improving || pendingStyle || !prompt.trim()) return;
     setImproving(true);
     try {
       const r = await api.improvePrompt(prompt);
       if (r.prompt) setPrompt(r.prompt);
     } catch {/* silent */}
     finally { setImproving(false); }
+  };
+
+  const applyStyle = async (styleKey: string) => {
+    if (improving || pendingStyle || !prompt.trim()) return;
+    setPendingStyle(styleKey);
+    try {
+      const r = await api.improvePrompt(prompt, styleKey);
+      if (r.prompt) setPrompt(r.prompt);
+    } catch {/* silent */}
+    finally { setPendingStyle(null); }
   };
 
   return (
@@ -148,23 +159,33 @@ export function ImagePanel({ initialMode = "create" }: { initialMode?: ImageMode
             <div className="flex flex-wrap gap-1.5 pt-1 items-center">
               <button
                 onClick={improvePrompt}
-                disabled={improving || !prompt.trim()}
+                disabled={improving || pendingStyle !== null || !prompt.trim()}
                 className="text-xs px-2.5 py-1 rounded-md border border-brand/40 bg-brand/5 text-brand hover:bg-brand/10 transition flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
                 title="Use AI to enrich your prompt"
               >
                 <Wand2 className={cn("h-3 w-3", improving && "animate-spin")} />
                 {improving ? "Thinking…" : "Improve"}
               </button>
-              {IMAGE_STYLE_CHIPS.map((c) => (
-                <button
-                  key={c.label}
-                  onClick={() => appendStyle(c.snippet)}
-                  className="text-xs px-2.5 py-1 rounded-md border border-border bg-bg-subtle text-fg-muted hover:text-brand hover:border-brand transition"
-                  title={c.snippet}
-                >
-                  + {c.label}
-                </button>
-              ))}
+              {IMAGE_STYLE_CHIPS.map((c) => {
+                const busy = pendingStyle === c.key;
+                const disabled = !prompt.trim() || improving || (pendingStyle !== null && !busy);
+                return (
+                  <button
+                    key={c.key}
+                    onClick={() => applyStyle(c.key)}
+                    disabled={disabled}
+                    className="text-xs px-2.5 py-1 rounded-md border border-border bg-bg-subtle text-fg-muted hover:text-brand hover:border-brand transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                    title={busy ? `Rewriting in ${c.label.toLowerCase()} style…` : `Rewrite prompt with ${c.label.toLowerCase()} style`}
+                  >
+                    {busy ? (
+                      <Wand2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <span>+</span>
+                    )}
+                    {c.label}
+                  </button>
+                );
+              })}
             </div>
           </Section>
 
@@ -212,23 +233,33 @@ export function ImagePanel({ initialMode = "create" }: { initialMode?: ImageMode
             <div className="flex flex-wrap gap-1.5 pt-1 items-center">
               <button
                 onClick={improvePrompt}
-                disabled={improving || !prompt.trim()}
+                disabled={improving || pendingStyle !== null || !prompt.trim()}
                 className="text-xs px-2.5 py-1 rounded-md border border-brand/40 bg-brand/5 text-brand hover:bg-brand/10 transition flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
                 title="Use AI to enrich your prompt"
               >
                 <Wand2 className={cn("h-3 w-3", improving && "animate-spin")} />
                 {improving ? "Thinking…" : "Improve"}
               </button>
-              {IMAGE_STYLE_CHIPS.map((c) => (
-                <button
-                  key={c.label}
-                  onClick={() => appendStyle(c.snippet)}
-                  className="text-xs px-2.5 py-1 rounded-md border border-border bg-bg-subtle text-fg-muted hover:text-brand hover:border-brand transition"
-                  title={c.snippet}
-                >
-                  + {c.label}
-                </button>
-              ))}
+              {IMAGE_STYLE_CHIPS.map((c) => {
+                const busy = pendingStyle === c.key;
+                const disabled = !prompt.trim() || improving || (pendingStyle !== null && !busy);
+                return (
+                  <button
+                    key={c.key}
+                    onClick={() => applyStyle(c.key)}
+                    disabled={disabled}
+                    className="text-xs px-2.5 py-1 rounded-md border border-border bg-bg-subtle text-fg-muted hover:text-brand hover:border-brand transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                    title={busy ? `Rewriting in ${c.label.toLowerCase()} style…` : `Rewrite prompt with ${c.label.toLowerCase()} style`}
+                  >
+                    {busy ? (
+                      <Wand2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <span>+</span>
+                    )}
+                    {c.label}
+                  </button>
+                );
+              })}
             </div>
           </Section>
 

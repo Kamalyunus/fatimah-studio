@@ -69,12 +69,11 @@ export function ProgressDisplay({ status, onCancel }: Props) {
     const samplerActive = node === "sampler" && total > 0 && total <= 100;
 
     // Storybook macro-progress nodes
-    const storybookMatch = node?.match(/^page-(\d+)-(image|animate)$/);
-    const transitionMatch = node?.match(/^transition-(\d+)$/);
-    const narrationMatch = node?.match(/^narration-(\d+)$/);
+    const storybookMatch = node?.match(/^page-(\d+)-(image|narrate|animate)$/);
+    const muxMatch = node?.match(/^mux-(\d+)$/);
     const isStorybookNode =
-      node === "planning" || node === "stitching" || node === "narrating"
-      || !!storybookMatch || !!transitionMatch || !!narrationMatch;
+      node === "planning" || node === "stitching"
+      || !!storybookMatch || !!muxMatch;
 
     let ratio: number;
     if (samplerActive) {
@@ -118,21 +117,17 @@ export function ProgressDisplay({ status, onCancel }: Props) {
     } else if (storybookMatch) {
       const pageNum = parseInt(storybookMatch[1], 10);
       const kind = storybookMatch[2];
-      const totalPages = total > 0 ? Math.ceil(total / 2) : 0;
-      friendly = kind === "image"
-        ? `Illustrating page ${pageNum}…`
-        : `Animating page ${pageNum}…`;
+      // 3 phases per page (image + narrate + animate)
+      const totalPages = total > 0 ? Math.ceil(total / 3) : 0;
+      friendly =
+        kind === "image"   ? `Illustrating page ${pageNum}…` :
+        kind === "narrate" ? `Recording narration for page ${pageNum}…` :
+                             `Animating page ${pageNum}…`;
       if (totalPages) subtitle = `Page ${pageNum} of ${totalPages}`;
-    } else if (transitionMatch) {
-      const idx = parseInt(transitionMatch[1], 10);
-      friendly = "Blending pages together…";
-      subtitle = `Transition ${idx}`;
-    } else if (narrationMatch) {
-      const idx = parseInt(narrationMatch[1], 10);
-      friendly = "Recording the storyteller's voice…";
+    } else if (muxMatch) {
+      const idx = parseInt(muxMatch[1], 10);
+      friendly = "Adding the storyteller's voice…";
       subtitle = `Page ${idx}`;
-    } else if (node === "narrating") {
-      friendly = "Preparing the storyteller…";
     } else {
       const labelMap: Record<string, string> = {
         model_loader: "Warming up the model…",

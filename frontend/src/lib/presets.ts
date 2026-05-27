@@ -25,12 +25,13 @@ export const IMAGE_STRENGTHS = [
   { key: "bold",     label: "Bold",     hint: "Reimagine it",      value: 0.85 },
 ];
 
+// Style chips. The `key` is sent to the backend LLM; the label is what the user sees.
 export const IMAGE_STYLE_CHIPS = [
-  { label: "Cinematic",     snippet: "cinematic lighting, dramatic, film still" },
-  { label: "Photorealistic", snippet: "photorealistic, 8k, sharp, professional photography" },
-  { label: "Anime",         snippet: "anime style, vibrant colors, Studio Ghibli-inspired" },
-  { label: "Painting",      snippet: "oil painting style, painterly brushstrokes" },
-  { label: "Pencil sketch", snippet: "detailed pencil sketch, graphite shading" },
+  { key: "cinematic",     label: "Cinematic" },
+  { key: "photorealistic", label: "Photorealistic" },
+  { key: "anime",         label: "Anime" },
+  { key: "painting",      label: "Painting" },
+  { key: "pencil sketch", label: "Pencil sketch" },
 ];
 
 // ---------- Sample prompts ----------
