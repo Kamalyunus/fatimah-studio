@@ -1,9 +1,11 @@
-import { useState } from "react";
-import { BookOpen, Square as SquareIcon } from "lucide-react";
+import { useEffect, useState } from "react";
+import { BookOpen, Square as SquareIcon, Trash2 } from "lucide-react";
 import { useStudio } from "../lib/store";
 import { Section, Textarea } from "./ui";
+import { api } from "../lib/api";
 import { ASPECTS, type Aspect } from "../lib/presets";
 import { cn } from "../lib/utils";
+import type { SavedCharacter } from "../types";
 
 type Style = "pixar" | "watercolor" | "anime" | "cartoon";
 
@@ -14,13 +16,13 @@ const STYLES: Array<{ key: Style; label: string; emoji: string; hint: string }> 
   { key: "cartoon",    label: "Cartoon",    emoji: "🖍️", hint: "Bright, bold" },
 ];
 
-// Each scene is a fixed 49-frame Wan clip at 16 fps = ~3 s. We let the user pick a
-// target duration; n_pages is derived by dividing by 3.
-const SECONDS_PER_SCENE = 3;
+// Each scene is a fixed 81-frame Wan clip at 16 fps ≈ 5 s. We let the user pick a
+// target duration; n_pages is derived by dividing by 5.
+const SECONDS_PER_SCENE = 5;
 const DURATION_OPTIONS = [
-  { seconds: 9,  label: "Short",  hint: "~20 min to make" },
-  { seconds: 18, label: "Medium", hint: "~40 min to make" },
-  { seconds: 27, label: "Long",   hint: "~60 min to make" },
+  { seconds: 30, label: "Short",  hint: "~55 min to make" },
+  { seconds: 45, label: "Medium", hint: "~80 min to make" },
+  { seconds: 60, label: "Long",   hint: "~105 min to make" },
 ];
 
 const STORY_SAMPLES = [
@@ -33,20 +35,39 @@ const STORY_SAMPLES = [
 export function StorybookPanel() {
   const { status, busyByOther, generateStorybook, cancel } = useStudio();
   const [story, setStory] = useState("");
-  const [durationSec, setDurationSec] = useState<number>(18);
+  const [durationSec, setDurationSec] = useState<number>(45);
   const [style, setStyle] = useState<Style>("pixar");
   const [aspect, setAspect] = useState<Aspect>("landscape");
+  const [characters, setCharacters] = useState<SavedCharacter[]>([]);
+  const [characterId, setCharacterId] = useState<string>("");
+
+  useEffect(() => {
+    let cancelled = false;
+    api.listCharacters()
+      .then((r) => { if (!cancelled) setCharacters(r.items); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [status.phase]);   // refresh after each generation so newly-saved characters appear
 
   const nPages = Math.max(1, Math.round(durationSec / SECONDS_PER_SCENE));
   const running = status.phase === "running" || status.phase === "queued";
   const canSubmit = !running && !!story.trim();
 
   const onGenerate = () => {
-    generateStorybook({ story, n_pages: nPages, style, aspect });
+    generateStorybook({ story, n_pages: nPages, style, aspect, character_id: characterId });
   };
 
-  // ~7s Flux image + ~5-6 min Wan animation per scene at 832×480, plus stitching.
-  const minutes = Math.round(nPages * 6 + 2);
+  const onDeleteCharacter = async (id: string) => {
+    if (!confirm("Forget this character?")) return;
+    await api.deleteCharacter(id);
+    if (characterId === id) setCharacterId("");
+    setCharacters((cs) => cs.filter((c) => c.id !== id));
+  };
+
+  // ~12s Flux image + ~8.5 min Wan per scene at 1024×576 with 81 frames
+  // (sageattn, 20 steps, TeaCache 0.20). Plus ~1 min for outline + critique
+  // planning passes and final stitching.
+  const minutes = Math.round(nPages * 8.5 + 4);
 
   return (
     <div className="flex flex-col gap-6">
@@ -85,6 +106,61 @@ export function StorybookPanel() {
           className="text-base leading-relaxed min-h-[28vh] w-full"
         />
       </Section>
+
+      {characters.length > 0 && (
+        <Section title="Main character" hint="Reuse one you made before, or start fresh">
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={() => setCharacterId("")}
+              className={cn(
+                "rounded-xl border p-2 transition-all text-left flex items-center gap-2",
+                characterId === ""
+                  ? "border-brand bg-brand/5 shadow-sm"
+                  : "border-border bg-bg-subtle hover:border-border-strong",
+              )}
+            >
+              <div className="h-12 w-12 rounded-md bg-bg-muted flex items-center justify-center text-xl">✨</div>
+              <div className="pr-1">
+                <div className="text-sm font-semibold">New character</div>
+                <div className="text-[10px] text-fg-subtle">Generated from the story</div>
+              </div>
+            </button>
+            {characters.map((c) => {
+              const active = c.id === characterId;
+              return (
+                <div key={c.id} className="relative group">
+                  <button
+                    onClick={() => setCharacterId(c.id)}
+                    className={cn(
+                      "rounded-xl border p-2 transition-all text-left flex items-center gap-2",
+                      active
+                        ? "border-brand bg-brand/5 shadow-sm"
+                        : "border-border bg-bg-subtle hover:border-border-strong",
+                    )}
+                    title={c.character}
+                  >
+                    <img src={api.characterImageUrl(c.id)} alt={c.name}
+                         className="h-12 w-12 rounded-md object-cover bg-bg-muted" loading="lazy" />
+                    <div className="pr-1 min-w-0">
+                      <div className="text-sm font-semibold truncate max-w-[140px]">{c.name}</div>
+                      <div className="text-[10px] text-fg-subtle truncate max-w-[140px]">
+                        {(c.canon?.species as string) || ""}
+                      </div>
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => onDeleteCharacter(c.id)}
+                    className="absolute -top-1 -right-1 h-5 w-5 rounded-full bg-bg-inset border border-border opacity-0 group-hover:opacity-100 transition flex items-center justify-center text-danger hover:bg-danger hover:text-white"
+                    title="Forget this character"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </Section>
+      )}
 
       <Section title="How long?" hint="Total video length">
         <div className="grid grid-cols-3 gap-2">

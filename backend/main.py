@@ -35,6 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
+import drift
 import llm
 
 # ---------- Config ----------
@@ -48,6 +49,10 @@ COMFY_INPUT = COMFY_ROOT / "input"
 STUDIO_ROOT = Path(__file__).resolve().parent
 THUMB_DIR = STUDIO_ROOT / "thumbs"
 HISTORY_FILE = STUDIO_ROOT / "history.json"
+# Persistent character library: saved character canons + their reference images,
+# so users can re-use the same protagonist across multiple storybooks.
+CHARACTER_LIBRARY_FILE = STUDIO_ROOT / "characters.json"
+CHARACTER_LIBRARY_DIR = STUDIO_ROOT / "character_refs"
 
 T5_MODEL = "umt5-xxl-enc-bf16.safetensors"
 VAE_MODEL = "Wan2_1_VAE_bf16.safetensors"
@@ -161,25 +166,6 @@ def _text_encode_node(p: "GenerateParams") -> dict:
             "t5": ["t5", 0],
             "force_offload": force_offload,
             "device": "gpu",
-        },
-    }
-
-
-def _interpolate_node(p: "GenerateParams") -> dict:
-    """RIFE frame interpolation. Doubles (or more) the frame count, run between decode and save."""
-    return {
-        "class_type": "RIFE VFI",
-        "inputs": {
-            "ckpt_name": "rife49.pth",
-            "frames": ["decode", 0],
-            "clear_cache_after_n_frames": 10,
-            "multiplier": max(2, int(p.interpolate_multiplier)),
-            "fast_mode": True,
-            "ensemble": False,
-            "scale_factor": 1.0,
-            "dtype": "float16",
-            "torch_compile": False,
-            "batch_size": 4,
         },
     }
 
@@ -300,7 +286,9 @@ def build_wan22_i2v_workflow(p: "GenerateParams") -> dict:
         wf["teacache"] = {
             "class_type": "WanVideoTeaCache",
             "inputs": {
-                "rel_l1_thresh": 0.20,  # Wan recommended
+                # 0.20 = Wan's recommended sweet spot. 0.25 was tried but visibly hurt
+                # fine texture quality.
+                "rel_l1_thresh": 0.20,
                 "start_step": 1,
                 "end_step": max(2, total_steps - 1),
                 "cache_device": "main_device",
@@ -357,13 +345,7 @@ def build_wan22_i2v_workflow(p: "GenerateParams") -> dict:
             "tile_stride_x": 144, "tile_stride_y": 128,
         },
     }
-    if p.interpolate:
-        wf["interpolate"] = _interpolate_node(p)
-        wf["save"] = _save_node("wan_studio_i2v_v22",
-                                 p.fps * max(2, int(p.interpolate_multiplier)),
-                                 ["interpolate", 0])
-    else:
-        wf["save"] = _save_node("wan_studio_i2v_v22", p.fps)
+    wf["save"] = _save_node("wan_studio_i2v_v22", p.fps)
     return wf
 
 
@@ -404,8 +386,10 @@ def build_flux_kontext_workflow(prompt: str, width: int, height: int, seed: int,
             },
         },
         "guidance": {
+            # 3.5 (was 2.5) — stronger adherence to the text prompt so Kontext follows
+            # the requested pose/scene change instead of just reproducing the reference.
             "class_type": "FluxGuidance",
-            "inputs": {"conditioning": ["ref_latent", 0], "guidance": 2.5},
+            "inputs": {"conditioning": ["ref_latent", 0], "guidance": 3.5},
         },
         "negative": {
             "class_type": "ConditioningZeroOut",
@@ -693,10 +677,6 @@ class GenerateParams(BaseModel):
     vae_tiling: bool = False             # tiled VAE decode for very high resolutions
     keep_t5_loaded: bool = False        # if true, T5 stays on its device after encoding
 
-    # Frame interpolation (post-process via RIFE)
-    interpolate: bool = False           # if true, run RIFE between decode and save
-    interpolate_multiplier: int = 2     # 2 = double fps, 3 = triple, etc.
-
     # Wan FLF2V (first-last frame): provide explicit ending frame for guaranteed pose continuity
     end_image: str = ""
 
@@ -738,9 +718,30 @@ class StorybookParams(BaseModel):
     user_emoji: str = ""
 
     story: str
-    n_pages: int = 6  # 3..9
+    n_pages: int = 9  # 2..12
     style: str = "pixar"  # pixar | watercolor | anime | cartoon
     aspect: str = "landscape"  # landscape | square | portrait
+    # Optional: id of a saved character to re-use across stories. When set, the
+    # orchestrator skips generating page 1's start image and uses the saved
+    # reference + canon instead, so the protagonist looks the same as previous runs.
+    character_id: str = ""
+
+
+class SavedCharacter(BaseModel):
+    """A character that can be re-used across multiple storybooks. Stored under
+    `characters.json` with the canonical reference image alongside in `character_refs/`."""
+    id: str
+    name: str
+    canon: dict   # {name, species, colors, features, clothing, accessories}
+    character: str   # the prose two-sentence canon (fallback when canon dict is empty)
+    ref_filename: str   # PNG in CHARACTER_LIBRARY_DIR
+    created_at: float
+    source_gen_id: str = ""   # which storybook gen produced this character
+
+
+class SaveCharacterParams(BaseModel):
+    name: str   # short user-facing name for the character (e.g. "Mochi")
+    gen_id: str   # storybook gen_id whose page-1 start image becomes the canonical ref
 
 
 class ImprovePromptParams(BaseModel):
@@ -777,6 +778,18 @@ class GenState:
         self.scene_descriptions: list[str] = []  # storybook: per-page LLM scene descriptions
         self.character: str = ""  # storybook: LLM-generated character description
 
+        # ----- Storybook keyframe preview gate (#2) -----
+        # When the orchestrator finishes generating all Flux start+end pairs, it sets
+        # node="awaiting-approval" and waits on `approval_event`. The frontend reads
+        # `keyframes` to show the strip, then POSTs /api/storybook/approve or /cancel.
+        self.approval_event: asyncio.Event = asyncio.Event()
+        self.approval_cancelled: bool = False
+        # Per-scene context, populated during the Flux phase. Each entry:
+        # {scene_index, start_image, end_image, description, motion_intensity, seed,
+        #  start_prompt, end_prompt}
+        # Mutable so the regenerate endpoint can update individual scenes in place.
+        self.keyframes: list[dict] = []
+
     def to_dict(self) -> dict:
         return {
             "prompt_id": self.prompt_id,
@@ -790,6 +803,20 @@ class GenState:
             "preview_images": list(self.preview_images),
             "scene_descriptions": list(self.scene_descriptions),
             "character": self.character,
+            # Lightweight view of the keyframe context for the frontend approval UI —
+            # only the filenames + per-scene metadata it actually needs to render.
+            "keyframes": [
+                {
+                    "scene_index": k.get("scene_index"),
+                    "start_image": k.get("start_image"),
+                    "end_image": k.get("end_image"),
+                    "description": k.get("description"),
+                    "motion_intensity": k.get("motion_intensity"),
+                    "drift": k.get("drift"),
+                    "drift_flagged": k.get("drift_flagged"),
+                }
+                for k in self.keyframes
+            ],
             "elapsed_s": time.time() - self.started_at,
         }
 
@@ -1208,9 +1235,11 @@ STYLE_PREFIXES = {
     "cartoon":    "friendly cartoon illustration, bold outlines, bright cheerful colors",
 }
 STORY_ASPECT_DIMS = {
-    "landscape": (832, 480),
-    "square":    (640, 640),
-    "portrait":  (480, 832),
+    # Bumped from 832×480 / 640×640 / 480×832 to ~30% more pixels per axis for
+    # noticeably sharper output. Wan time scales roughly with pixel count.
+    "landscape": (1024, 576),
+    "square":    (768, 768),
+    "portrait":  (576, 1024),
 }
 
 
@@ -1253,64 +1282,6 @@ async def _submit_comfy_and_wait(workflow: dict, timeout_s: float = 600.0) -> st
                         return item["filename"]
 
 
-async def _ffmpeg_extract_frame(video_path: str, output_png: Path, last: bool):
-    """Extract first or last frame of a video as a PNG."""
-    if last:
-        # Seek to 0.5s before end, then take 1 frame (covers any short clip)
-        args = ["ffmpeg", "-y", "-sseof", "-0.5", "-i", video_path,
-                "-update", "1", "-frames:v", "1", str(output_png)]
-    else:
-        args = ["ffmpeg", "-y", "-i", video_path,
-                "-frames:v", "1", str(output_png)]
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg frame extract failed: {stderr.decode()[:300]}")
-
-
-def _build_transition_workflow(img_a_name: str, img_b_name: str, prefix: str, multiplier: int = 16) -> dict:
-    """RIFE-morph from img_a → img_b over `multiplier` intermediate frames."""
-    return {
-        "load_a": {"class_type": "LoadImage", "inputs": {"image": img_a_name}},
-        "load_b": {"class_type": "LoadImage", "inputs": {"image": img_b_name}},
-        "batch": {
-            "class_type": "ImageBatch",
-            "inputs": {"image1": ["load_a", 0], "image2": ["load_b", 0]},
-        },
-        "rife": {
-            "class_type": "RIFE VFI",
-            "inputs": {
-                "ckpt_name": "rife49.pth",
-                "frames": ["batch", 0],
-                "clear_cache_after_n_frames": 10,
-                "multiplier": int(multiplier),
-                "fast_mode": True,
-                "ensemble": False,
-                "scale_factor": 1.0,
-                "dtype": "float16",
-                "torch_compile": False,
-                "batch_size": 4,
-            },
-        },
-        "save": {
-            "class_type": "VHS_VideoCombine",
-            "inputs": {
-                "images": ["rife", 0],
-                "frame_rate": 16,
-                "loop_count": 0,
-                "filename_prefix": prefix,
-                "format": "video/h264-mp4",
-                "pingpong": False,
-                "save_output": True,
-            },
-        },
-    }
-
-
 async def _stitch_videos(paths: list[str], output_path: str, hold_dur: float = 0.0):
     """Hard-cut concat of silent video clips. If hold_dur > 0, the last frame of each
     clip is tpad-extended before the cut (page-turn beat). Storybook uses hold_dur=0
@@ -1347,6 +1318,24 @@ async def _stitch_videos(paths: list[str], output_path: str, hold_dur: float = 0
         raise RuntimeError(f"ffmpeg stitch failed: {stderr.decode()[:500]}")
 
 
+def _build_wan_prompt(video_prompt: str, starting_pose: str, ending_pose: str,
+                      character: str, style: str) -> str:
+    """Assemble the full Wan prompt from the LLM's per-scene direction. Kept as a small
+    helper so the per-scene regen path can call it without duplicating the template."""
+    pose_chain = ""
+    if starting_pose and ending_pose:
+        pose_chain = (
+            f" The scene starts with {character} {starting_pose}, and ends with "
+            f"{character} {ending_pose}."
+        )
+    elif ending_pose:
+        pose_chain = f" The scene ends with {character} {ending_pose}."
+    return (
+        f"{video_prompt}{pose_chain} {character} "
+        f"Storybook illustration style, {style} aesthetic, soft cinematic lighting, smooth gentle motion."
+    )
+
+
 async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
     """Background orchestration: plan → image per page → video per page → stitch."""
     global _active_gen, _last_error
@@ -1358,9 +1347,29 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         # planner LLM can load without contending for GPU memory.
         await _comfy_free()
 
-        # 1) Use the LLM to plan
-        plan = await llm.plan_storybook(p.story, p.n_pages, p.style)
+        # If the user picked a saved character, load its canon + reference image and
+        # tell the planner to keep that character's canonical description verbatim.
+        saved_character: Optional[dict] = None
+        if p.character_id:
+            library = _load_json(CHARACTER_LIBRARY_FILE, [])
+            saved_character = next((c for c in library if c.get("id") == p.character_id), None)
+            if saved_character:
+                ref_src = CHARACTER_LIBRARY_DIR / (saved_character.get("ref_filename") or "")
+                if not ref_src.exists():
+                    saved_character = None  # silent fallback to fresh generation
+
+        # 1) Use the LLM to plan (passing the saved character's canon, if any, so the
+        # LLM treats it as locked rather than inventing a new protagonist).
+        plan = await llm.plan_storybook(
+            p.story, p.n_pages, p.style,
+            existing_canon=saved_character.get("canon") if saved_character else None,
+            existing_character=saved_character.get("character") if saved_character else None,
+        )
         character = plan.get("character", "")
+        # Render the structured character canon once and reuse it verbatim in every
+        # Flux prompt — Kontext alone can drift on outfit/feature details. Fallback
+        # to the prose `character` field if canon is missing.
+        canon_clause = llm.render_canon(plan.get("character_canon")) or character
         scenes = plan.get("scenes") or []
         if not scenes:
             raise RuntimeError("LLM returned no scenes")
@@ -1379,119 +1388,168 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         width, height = STORY_ASPECT_DIMS.get(p.aspect, STORY_ASPECT_DIMS["landscape"])
         seed = int(time.time()) % (2**31)
 
-        page_videos: list[str] = []
-        prev_image: Optional[str] = None
-        # Phases per page: image, animate
+        # noise_aug per motion intensity: stiller scenes get less Wan freedom (cleaner),
+        # dynamic scenes get more (Wan needs room to invent in-betweens).
+        NOISE_AUG_BY_INTENSITY = {"still": 0.0, "gentle": 0.05, "dynamic": 0.10}
+
+        kontext_available = (Path("/media/yunus/More Data/comfyui-models/diffusion_models") / FLUX_KONTEXT_MODEL).exists()
+        ref_name = f"storybook_charref_{gen_id}.png"
+
+        # Total steps: image + animate per scene; the keyframe preview gate sits between.
         total = len(scenes) * 2
         step_done = 0
 
+        # =================== PHASE A — Generate all Flux start+end pairs ===================
+        # We do this in one pass so the user can preview every keyframe before committing
+        # to the heavy Wan phase.
+        prev_end_image_filename: Optional[str] = None
         for i, scene in enumerate(scenes):
             scene_desc = scene.get("description") or "A scene from the story."
-            motion = scene.get("motion") or "gentle subtle motion"
-            video_prompt = scene.get("video_prompt") or motion
             starting_pose = scene.get("starting_pose") or ""
             ending_pose = scene.get("ending_pose") or ""
+            intensity = (scene.get("motion_intensity") or "gentle").lower()
 
-            # --- Generate page image ---
             if _active_gen is not None:
                 _active_gen.node = f"page-{i+1}-image"
                 _active_gen.step = step_done
                 _active_gen.total_steps = total
 
-            kontext_available = (Path("/media/yunus/More Data/comfyui-models/diffusion_models") / FLUX_KONTEXT_MODEL).exists()
-            ref_name = f"storybook_charref_{gen_id}.png"
             start_image_input_name = f"storybook_start_p{i}_{gen_id}.png"
             end_image_input_name = f"storybook_end_p{i}_{gen_id}.png"
 
-            def _flux_workflow_for(prompt_text: str, this_seed: int, ref_required: bool):
-                if ref_required and kontext_available and (COMFY_INPUT / ref_name).exists():
-                    return build_flux_kontext_workflow(
-                        prompt=prompt_text, width=width, height=height,
-                        seed=this_seed, reference_image=ref_name, steps=20,
-                    )
-                return build_flux_image_workflow(ImageGenerateParams(
-                    image_mode="create", prompt=prompt_text,
-                    width=width, height=height, seed=this_seed, model="flux",
-                ))
-
             # ---- START image ----
-            # The strip thumbnail for this page IS this page's start frame:
-            #  - Page 1: freshly generated start
-            #  - Page N≥2: byte-perfect copy of page N-1's end (so the strip reads as a
-            #    chained keyframe storyboard, exactly N thumbnails for N pages).
+            # Page 1: fresh Flux gen (or saved-character reference). Pages 2+: byte-perfect
+            # copy of the previous page's end image (so cuts are invisible at stitch time).
+            start_prompt = ""
             if i == 0:
                 start_pose_text = starting_pose or "in an initial settled pose"
-                start_prompt = f"{style_prefix}. {character} {scene_desc}. {character} is {start_pose_text}."
-                wf = _flux_workflow_for(start_prompt, seed, ref_required=False)
-                start_out = await _submit_comfy_and_wait(wf, timeout_s=300)
-                # Copy as Wan start input + as the canonical character reference for Kontext
-                shutil.copyfile(str(COMFY_OUTPUT / start_out), str(COMFY_INPUT / start_image_input_name))
-                shutil.copyfile(str(COMFY_OUTPUT / start_out), str(COMFY_INPUT / ref_name))
-                page_thumb = start_out
+                if saved_character:
+                    saved_ref = CHARACTER_LIBRARY_DIR / saved_character["ref_filename"]
+                    shutil.copyfile(str(saved_ref), str(COMFY_INPUT / start_image_input_name))
+                    shutil.copyfile(str(saved_ref), str(COMFY_INPUT / ref_name))
+                    page1_seed_name = f"saved_char_p0_{gen_id}.png"
+                    shutil.copyfile(str(saved_ref), str(COMFY_OUTPUT / page1_seed_name))
+                    page_thumb = page1_seed_name
+                else:
+                    start_prompt = (
+                        f"{style_prefix}. {canon_clause}. {scene_desc}. "
+                        f"{character} is {start_pose_text}."
+                    )
+                    wf = build_flux_image_workflow(ImageGenerateParams(
+                        image_mode="create", prompt=start_prompt,
+                        width=width, height=height, seed=seed, model="flux",
+                    ))
+                    start_out = await _submit_comfy_and_wait(wf, timeout_s=300)
+                    shutil.copyfile(str(COMFY_OUTPUT / start_out), str(COMFY_INPUT / start_image_input_name))
+                    shutil.copyfile(str(COMFY_OUTPUT / start_out), str(COMFY_INPUT / ref_name))
+                    page_thumb = start_out
             else:
-                # Continuity: page N+1's start frame == page N's end frame (byte-perfect)
                 shutil.copyfile(str(COMFY_OUTPUT / prev_end_image_filename), str(COMFY_INPUT / start_image_input_name))
                 page_thumb = prev_end_image_filename
             if _active_gen is not None:
                 _active_gen.preview_images.append(page_thumb)
 
-            # ---- END image (Wan FLF2V target — where motion lands) ----
+            # ---- END image (Wan FLF2V target) ----
             end_pose_text = ending_pose or starting_pose or "in a settled, restful pose"
             end_prompt = (
-                f"{style_prefix}. Same character: {character}. "
-                f"{scene_desc}. {character} is now {end_pose_text}."
+                f"{character} {end_pose_text}. "
+                f"{scene_desc}. {style_prefix}. "
+                f"Character canon (must match exactly): {canon_clause}. "
+                f"The character's appearance matches the reference exactly, "
+                f"but the pose, body position, and gesture are clearly different from the reference."
             )
-            wf_end = _flux_workflow_for(end_prompt, seed + i * 100 + 7, ref_required=True)
+            end_seed = seed + i * 100 + 7
+            wf_end = (
+                build_flux_kontext_workflow(
+                    prompt=end_prompt, width=width, height=height,
+                    seed=end_seed, reference_image=ref_name, steps=20,
+                )
+                if kontext_available and (COMFY_INPUT / ref_name).exists()
+                else build_flux_image_workflow(ImageGenerateParams(
+                    image_mode="create", prompt=end_prompt,
+                    width=width, height=height, seed=end_seed, model="flux",
+                ))
+            )
             end_out = await _submit_comfy_and_wait(wf_end, timeout_s=300)
             shutil.copyfile(str(COMFY_OUTPUT / end_out), str(COMFY_INPUT / end_image_input_name))
             prev_end_image_filename = end_out
-            prev_image = end_out
+
+            # Cache per-scene context so the keyframe-regen endpoint can re-run this scene
+            # individually, and so the Wan phase below has everything it needs without
+            # re-deriving prompts.
+            if _active_gen is not None:
+                _active_gen.keyframes.append({
+                    "scene_index": i,
+                    "start_image": page_thumb,
+                    "end_image": end_out,
+                    "start_input_name": start_image_input_name,
+                    "end_input_name": end_image_input_name,
+                    "description": scene_desc,
+                    "motion_intensity": intensity,
+                    "start_prompt": start_prompt,   # empty for page 1 when saved_character is used
+                    "end_prompt": end_prompt,
+                    "end_seed": end_seed,
+                    "wan_prompt": _build_wan_prompt(
+                        scene.get("video_prompt") or scene.get("motion") or "gentle motion",
+                        starting_pose, ending_pose, character, p.style,
+                    ),
+                })
             step_done += 1
 
-            # ---- Animate (Wan 2.2 FLF2V: start + end frame conditioning) ----
-            # Fixed 49 frames @ 16 fps = ~3 s per page. Wan's trained sweet spot for
-            # storybook pacing; tail-hold added at stitch time for the "page turn" beat.
-            frames = 49
+        # =================== CLIP drift detection ===================
+        # Score every scene's start frame against the canonical character reference and
+        # attach the cosine similarity to its keyframe entry, so the UI can flag scenes
+        # whose character has drifted (per #4). Runs on CPU; takes a second or two.
+        try:
+            ref_path = COMFY_INPUT / ref_name
+            scene_paths = [COMFY_OUTPUT / kf["start_image"] for kf in _active_gen.keyframes] if _active_gen else []
+            if _active_gen and ref_path.exists() and scene_paths:
+                sims = await drift.score_drift(ref_path, scene_paths)
+                for kf, sim in zip(_active_gen.keyframes, sims):
+                    kf["drift"] = sim   # None if scoring failed
+                    kf["drift_flagged"] = (sim is not None and sim < drift.DRIFT_THRESHOLD)
+        except Exception as e:
+            print(f"[storybook] drift detection failed (non-fatal): {e}")
 
+        # =================== Approval gate ===================
+        if _active_gen is not None:
+            _active_gen.node = "awaiting-approval"
+            _active_gen.step = step_done
+            _active_gen.approval_event.clear()
+            _active_gen.approval_cancelled = False
+            await _active_gen.approval_event.wait()
+            if _active_gen is None or _active_gen.approval_cancelled:
+                raise RuntimeError("storybook cancelled at preview")
+
+        # =================== PHASE B — Wan animations per scene ===================
+        page_videos: list[str] = []
+        for kf in (_active_gen.keyframes if _active_gen else []):
+            i = kf["scene_index"]
             if _active_gen is not None:
                 _active_gen.node = f"page-{i+1}-animate"
                 _active_gen.step = step_done
 
-            pose_chain = ""
-            if starting_pose and ending_pose:
-                pose_chain = (
-                    f" The scene starts with {character} {starting_pose}, and ends with "
-                    f"{character} {ending_pose}."
-                )
-            elif ending_pose:
-                pose_chain = f" The scene ends with {character} {ending_pose}."
-            wan_full_prompt = (
-                f"{video_prompt}{pose_chain} {character} "
-                f"Storybook illustration style, {p.style} aesthetic, soft cinematic lighting, smooth gentle motion."
-            )
             i2v_params = GenerateParams(
-                prompt=wan_full_prompt,
+                prompt=kf["wan_prompt"],
                 negative=DEFAULT_NEGATIVE,
                 width=width, height=height,
-                frames=frames, steps=20,
+                frames=81, steps=20,
                 cfg=6.0, shift=5.0, seed=seed,
                 fps=16, scheduler="unipc",
-                noise_aug=0.0,
-                image=start_image_input_name,
-                end_image=end_image_input_name,  # FLF2V — Wan lands on this exact frame
+                noise_aug=NOISE_AUG_BY_INTENSITY.get(kf["motion_intensity"], 0.05),
+                image=kf["start_input_name"],
+                end_image=kf["end_input_name"],
                 multi_gpu=True,
-                attention_mode="sdpa",
+                attention_mode="sageattn",
                 block_swap_count=15, block_swap_device="cuda:1",
                 vae_tiling=False,
                 keep_t5_loaded=True,
-                interpolate=False,
                 use_slg=True, use_feta=True, use_teacache=True,
             )
-            # 81-frame jobs take ~65% longer than 49 — bump timeout proportionally
-            wan_timeout = 1500 if frames == 49 else 2400
             wf_v = build_wan22_i2v_workflow(i2v_params)
-            vid_filename = await _submit_comfy_and_wait(wf_v, timeout_s=wan_timeout)
+            vid_filename = await _submit_comfy_and_wait(wf_v, timeout_s=2400)
             page_videos.append(str(COMFY_OUTPUT / vid_filename))
+            kf["video"] = vid_filename   # remembered so per-scene-regen (#3) can find it later
             step_done += 1
 
         # --- Final stitch: hard-cut concat of raw Wan clips. ---
@@ -1506,7 +1564,23 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         final_path = COMFY_OUTPUT / final_filename
         await _stitch_videos(page_videos, str(final_path), hold_dur=0.0)
 
-        # Save to history
+        # Save to history. We persist the full keyframe metadata so the per-scene
+        # regenerate endpoint (#3) can re-animate a single scene later without
+        # re-deriving prompts, seeds, or input filenames.
+        scene_records = [
+            {
+                "scene_index": kf["scene_index"],
+                "start_image": kf["start_image"],
+                "end_image": kf["end_image"],
+                "start_input_name": kf["start_input_name"],
+                "end_input_name": kf["end_input_name"],
+                "video": kf.get("video"),
+                "wan_prompt": kf["wan_prompt"],
+                "motion_intensity": kf["motion_intensity"],
+                "description": kf["description"],
+            }
+            for kf in (_active_gen.keyframes if _active_gen else [])
+        ]
         items = _load_json(HISTORY_FILE, [])
         items = [it for it in items if it.get("prompt_id") != prompt_id]
         items.insert(0, {
@@ -1520,6 +1594,10 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 **p.model_dump(),
                 "plan": plan,
                 "page_videos": [os.path.basename(v) for v in page_videos],
+                "scenes_meta": scene_records,
+                "width": width,
+                "height": height,
+                "seed": seed,
             },
             "created_by_name": p.user_name,
             "created_by_emoji": p.user_emoji,
@@ -1541,8 +1619,8 @@ async def storybook(p: StorybookParams):
         raise HTTPException(503, "backend not ready")
     if not p.story.strip():
         raise HTTPException(400, "story is required")
-    if p.n_pages < 2 or p.n_pages > 9:
-        raise HTTPException(400, "n_pages must be 2..9")
+    if p.n_pages < 2 or p.n_pages > 12:
+        raise HTTPException(400, "n_pages must be 2..12")
     if not await llm.is_available():
         raise HTTPException(503, "Local LLM (Ollama llama3.2:3b) is not available. Start ollama and pull the model.")
     async with _state_lock:
@@ -1561,6 +1639,315 @@ async def storybook(p: StorybookParams):
 
     asyncio.create_task(_run_storybook(p, prompt_id, gen_id))
     return {"prompt_id": prompt_id, "gen_id": gen_id, "kind": "storybook"}
+
+
+# ---------- Storybook keyframe-preview approval gate (#2) ----------
+
+class RegenerateKeyframeParams(BaseModel):
+    scene_index: int
+    frame: str = Field("end", pattern="^(start|end)$")
+
+
+@app.post("/api/storybook/approve")
+async def storybook_approve():
+    """Tell the orchestrator that the user is happy with the keyframes — proceed to Wan."""
+    if _active_gen is None or _active_gen.kind != "storybook":
+        raise HTTPException(409, "no storybook awaiting approval")
+    if _active_gen.node != "awaiting-approval":
+        raise HTTPException(409, f"storybook is in '{_active_gen.node}' state, not waiting for approval")
+    _active_gen.approval_cancelled = False
+    _active_gen.approval_event.set()
+    return {"ok": True}
+
+
+@app.post("/api/storybook/cancel_approval")
+async def storybook_cancel_approval():
+    """User rejected the keyframes; abort the storybook cleanly without running Wan."""
+    if _active_gen is None or _active_gen.kind != "storybook":
+        raise HTTPException(409, "no storybook awaiting approval")
+    if _active_gen.node != "awaiting-approval":
+        raise HTTPException(409, f"storybook is in '{_active_gen.node}' state, not waiting for approval")
+    _active_gen.approval_cancelled = True
+    _active_gen.approval_event.set()
+    return {"ok": True}
+
+
+@app.post("/api/storybook/regenerate_keyframe")
+async def storybook_regenerate_keyframe(p: RegenerateKeyframeParams):
+    """While the storybook is paused at the approval gate, re-run a single Flux frame
+    (start or end of scene N) with a fresh seed. Updates the keyframe cache in place
+    so the preview strip shows the new image. Wan has not started yet, so this is cheap."""
+    if _active_gen is None or _active_gen.kind != "storybook":
+        raise HTTPException(409, "no storybook awaiting approval")
+    if _active_gen.node != "awaiting-approval":
+        raise HTTPException(409, "regen only allowed during keyframe approval")
+    keyframes = _active_gen.keyframes
+    if not (0 <= p.scene_index < len(keyframes)):
+        raise HTTPException(400, "scene_index out of range")
+    if p.frame == "start" and p.scene_index > 0:
+        raise HTTPException(400, "page 2+ start frames are byte-perfect copies of the previous end; regen that end frame instead")
+
+    kf = keyframes[p.scene_index]
+    gen_id = _active_gen.gen_id
+    params = _active_gen.params or {}
+    width = STORY_ASPECT_DIMS.get(params.get("aspect", "landscape"), STORY_ASPECT_DIMS["landscape"])[0]
+    height = STORY_ASPECT_DIMS.get(params.get("aspect", "landscape"), STORY_ASPECT_DIMS["landscape"])[1]
+    ref_name = f"storybook_charref_{gen_id}.png"
+    kontext_available = (
+        Path("/media/yunus/More Data/comfyui-models/diffusion_models") / FLUX_KONTEXT_MODEL
+    ).exists() and (COMFY_INPUT / ref_name).exists()
+
+    new_seed = int(time.time() * 1000) % (2**31)
+    await _comfy_free()
+    if p.frame == "start":
+        prompt_text = kf.get("start_prompt") or ""
+        if not prompt_text:
+            raise HTTPException(409, "this start frame is from a saved character and cannot be regenerated")
+        wf = build_flux_image_workflow(ImageGenerateParams(
+            image_mode="create", prompt=prompt_text,
+            width=width, height=height, seed=new_seed, model="flux",
+        ))
+        out = await _submit_comfy_and_wait(wf, timeout_s=300)
+        shutil.copyfile(str(COMFY_OUTPUT / out), str(COMFY_INPUT / kf["start_input_name"]))
+        shutil.copyfile(str(COMFY_OUTPUT / out), str(COMFY_INPUT / ref_name))
+        kf["start_image"] = out
+        if _active_gen.preview_images:
+            _active_gen.preview_images[0] = out
+        await _rescore_drift_for_active()
+        return {"ok": True, "filename": out}
+    else:
+        prompt_text = kf["end_prompt"]
+        wf = (
+            build_flux_kontext_workflow(
+                prompt=prompt_text, width=width, height=height,
+                seed=new_seed, reference_image=ref_name, steps=20,
+            )
+            if kontext_available
+            else build_flux_image_workflow(ImageGenerateParams(
+                image_mode="create", prompt=prompt_text,
+                width=width, height=height, seed=new_seed, model="flux",
+            ))
+        )
+        out = await _submit_comfy_and_wait(wf, timeout_s=300)
+        shutil.copyfile(str(COMFY_OUTPUT / out), str(COMFY_INPUT / kf["end_input_name"]))
+        kf["end_image"] = out
+        # If a later scene took this scene's end as its start, propagate the change so
+        # FLF2V chaining stays byte-perfect.
+        if p.scene_index + 1 < len(keyframes):
+            next_kf = keyframes[p.scene_index + 1]
+            shutil.copyfile(str(COMFY_OUTPUT / out), str(COMFY_INPUT / next_kf["start_input_name"]))
+            next_kf["start_image"] = out
+            if _active_gen.preview_images and (p.scene_index + 1) < len(_active_gen.preview_images):
+                _active_gen.preview_images[p.scene_index + 1] = out
+        await _rescore_drift_for_active()
+        return {"ok": True, "filename": out}
+
+
+async def _rescore_drift_for_active() -> None:
+    """Recompute CLIP drift scores against the canonical reference for the
+    currently-active storybook gen. No-op if nothing is active."""
+    if _active_gen is None or _active_gen.kind != "storybook":
+        return
+    ref_name = f"storybook_charref_{_active_gen.gen_id}.png"
+    ref_path = COMFY_INPUT / ref_name
+    if not ref_path.exists():
+        return
+    try:
+        scene_paths = [COMFY_OUTPUT / kf["start_image"] for kf in _active_gen.keyframes]
+        sims = await drift.score_drift(ref_path, scene_paths)
+        for kf, sim in zip(_active_gen.keyframes, sims):
+            kf["drift"] = sim
+            kf["drift_flagged"] = (sim is not None and sim < drift.DRIFT_THRESHOLD)
+    except Exception as e:
+        print(f"[storybook] drift rescore failed: {e}")
+
+
+# ---------- Per-scene Wan regenerate after a storybook has finished (#3) ----------
+
+class RegenerateSceneParams(BaseModel):
+    gen_id: str
+    scene_index: int
+
+
+async def _restitch_storybook_from_history(entry: dict) -> str:
+    """Read scenes_meta from a history entry, concat the per-scene videos into the
+    final stitched MP4 (overwriting whatever was there). Returns the final filename."""
+    final_filename = entry["filename"]
+    scenes_meta = (entry.get("params") or {}).get("scenes_meta") or []
+    page_video_paths = [
+        str(COMFY_OUTPUT / s["video"]) for s in scenes_meta if s.get("video")
+    ]
+    if not page_video_paths:
+        raise RuntimeError("no per-scene videos found to stitch")
+    await _stitch_videos(page_video_paths, str(COMFY_OUTPUT / final_filename), hold_dur=0.0)
+    return final_filename
+
+
+@app.post("/api/storybook/regenerate_scene")
+async def storybook_regenerate_scene(p: RegenerateSceneParams):
+    """Re-animate a single scene's Wan clip using the cached keyframes from the original
+    run, then re-stitch the final video. The other scenes are untouched."""
+    global _active_gen, _last_error
+    if _state_lock is None:
+        raise HTTPException(503, "backend not ready")
+    items = _load_json(HISTORY_FILE, [])
+    entry = next((it for it in items if it.get("id") == p.gen_id and it.get("kind") == "storybook"), None)
+    if not entry:
+        raise HTTPException(404, "no storybook with that gen_id in history")
+    params = entry.get("params") or {}
+    scenes_meta = params.get("scenes_meta") or []
+    target = next((s for s in scenes_meta if int(s.get("scene_index", -1)) == p.scene_index), None)
+    if not target:
+        raise HTTPException(404, "scene_index not found in this storybook's metadata")
+    # Sanity: input frames must still be on disk
+    for fname in (target["start_input_name"], target["end_input_name"]):
+        if not (COMFY_INPUT / fname).exists():
+            raise HTTPException(409, f"input frame '{fname}' is no longer on disk — can't regen")
+
+    async with _state_lock:
+        if _active_gen is not None:
+            raise HTTPException(409, "another generation is in progress")
+        synthetic_prompt_id = f"regen-{p.gen_id}-{p.scene_index}-{int(time.time())}"
+        _active_gen = GenState(
+            prompt_id=synthetic_prompt_id,
+            gen_id=p.gen_id,
+            params={**params, "regenerating_scene": p.scene_index},
+            started_at=time.time(),
+            kind="storybook",
+        )
+        _active_gen.node = f"page-{p.scene_index+1}-animate"
+        _active_gen.step = 1
+        _active_gen.total_steps = 2
+        _last_error = None
+
+    asyncio.create_task(_do_regenerate_scene(p.gen_id, p.scene_index, target, params))
+    return {"ok": True, "prompt_id": synthetic_prompt_id}
+
+
+async def _do_regenerate_scene(gen_id: str, scene_index: int, target: dict, params: dict):
+    """Background task: re-run Wan for one scene, write the new clip into the existing
+    scenes_meta slot, then re-stitch the final video."""
+    global _active_gen, _last_error
+    NOISE_AUG_BY_INTENSITY = {"still": 0.0, "gentle": 0.05, "dynamic": 0.10}
+    try:
+        await llm.unload()
+        i2v_params = GenerateParams(
+            prompt=target["wan_prompt"],
+            negative=DEFAULT_NEGATIVE,
+            width=int(params.get("width") or 1024),
+            height=int(params.get("height") or 576),
+            frames=81, steps=20,
+            cfg=6.0, shift=5.0,
+            # Bump seed so the regen is actually different from the original
+            seed=int(time.time() * 1000) % (2**31),
+            fps=16, scheduler="unipc",
+            noise_aug=NOISE_AUG_BY_INTENSITY.get(target.get("motion_intensity") or "gentle", 0.05),
+            image=target["start_input_name"],
+            end_image=target["end_input_name"],
+            multi_gpu=True,
+            attention_mode="sageattn",
+            block_swap_count=15, block_swap_device="cuda:1",
+            vae_tiling=False,
+            keep_t5_loaded=True,
+            use_slg=True, use_feta=True, use_teacache=True,
+        )
+        wf = build_wan22_i2v_workflow(i2v_params)
+        new_video = await _submit_comfy_and_wait(wf, timeout_s=2400)
+
+        # Patch the history entry: swap in the new per-scene video filename, then restitch.
+        if _active_gen is not None:
+            _active_gen.node = "stitching"
+            _active_gen.step = 2
+        items = _load_json(HISTORY_FILE, [])
+        for it in items:
+            if it.get("id") != gen_id or it.get("kind") != "storybook":
+                continue
+            sm = (it.get("params") or {}).get("scenes_meta") or []
+            for s in sm:
+                if int(s.get("scene_index", -1)) == scene_index:
+                    s["video"] = new_video
+                    break
+            # update the params.page_videos mirror (legacy)
+            it["params"]["page_videos"] = [s.get("video") for s in sm if s.get("video")]
+            await _restitch_storybook_from_history(it)
+            _save_json(HISTORY_FILE, items)
+            break
+    except Exception as e:
+        print(f"[storybook] scene regen failed: {e}")
+        _last_error = f"scene regen failed: {e}"
+    finally:
+        _active_gen = None
+
+
+# ---------- Character library (re-use a protagonist across multiple stories) ----------
+
+@app.get("/api/characters")
+async def list_characters():
+    return {"items": _load_json(CHARACTER_LIBRARY_FILE, [])}
+
+
+@app.post("/api/characters")
+async def save_character(p: SaveCharacterParams):
+    """Persist the character from a completed storybook gen into the library.
+    Pulls the canonical reference image (page 1's start frame, saved under
+    `input/storybook_charref_<gen_id>.png`) and the canon dict from history."""
+    items = _load_json(HISTORY_FILE, [])
+    entry = next((it for it in items if it.get("id") == p.gen_id and it.get("kind") == "storybook"), None)
+    if not entry:
+        raise HTTPException(404, "no storybook with that gen_id in history")
+
+    plan = (entry.get("params") or {}).get("plan") or {}
+    canon = plan.get("character_canon") or {}
+    character_prose = plan.get("character") or ""
+
+    src_ref = COMFY_INPUT / f"storybook_charref_{p.gen_id}.png"
+    if not src_ref.exists():
+        raise HTTPException(404, "character reference image no longer on disk for that gen")
+
+    CHARACTER_LIBRARY_DIR.mkdir(exist_ok=True)
+    char_id = uuid.uuid4().hex[:10]
+    ref_filename = f"char_{char_id}.png"
+    shutil.copyfile(str(src_ref), str(CHARACTER_LIBRARY_DIR / ref_filename))
+
+    saved = {
+        "id": char_id,
+        "name": p.name.strip() or (canon.get("name") or "Character").strip(),
+        "canon": canon,
+        "character": character_prose,
+        "ref_filename": ref_filename,
+        "created_at": time.time(),
+        "source_gen_id": p.gen_id,
+    }
+    library = _load_json(CHARACTER_LIBRARY_FILE, [])
+    library.insert(0, saved)
+    _save_json(CHARACTER_LIBRARY_FILE, library[:100])
+    return saved
+
+
+@app.delete("/api/characters/{char_id}")
+async def delete_character(char_id: str):
+    library = _load_json(CHARACTER_LIBRARY_FILE, [])
+    target = next((c for c in library if c.get("id") == char_id), None)
+    library = [c for c in library if c.get("id") != char_id]
+    _save_json(CHARACTER_LIBRARY_FILE, library)
+    if target:
+        ref = CHARACTER_LIBRARY_DIR / (target.get("ref_filename") or "")
+        if ref.exists():
+            try: ref.unlink()
+            except Exception: pass
+    return {"ok": True}
+
+
+@app.get("/api/characters/{char_id}/image")
+async def get_character_image(char_id: str):
+    library = _load_json(CHARACTER_LIBRARY_FILE, [])
+    target = next((c for c in library if c.get("id") == char_id), None)
+    if not target:
+        raise HTTPException(404, "character not found")
+    ref_path = CHARACTER_LIBRARY_DIR / (target.get("ref_filename") or "")
+    if not ref_path.exists():
+        raise HTTPException(404, "reference image missing")
+    return FileResponse(ref_path, media_type="image/png")
 
 
 @app.post("/api/llm/improve")

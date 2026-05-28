@@ -29,6 +29,27 @@ export interface StorybookParams {
   n_pages: number;
   style: "pixar" | "watercolor" | "anime" | "cartoon";
   aspect: "landscape" | "square" | "portrait";
+  character_id?: string;   // id of a saved character to re-use; empty = generate fresh
+}
+
+export interface SavedCharacter {
+  id: string;
+  name: string;
+  canon: Record<string, string>;
+  character: string;
+  ref_filename: string;
+  created_at: number;
+  source_gen_id?: string;
+}
+
+export interface KeyframePreview {
+  scene_index: number;
+  start_image: string;
+  end_image: string;
+  description?: string;
+  motion_intensity?: string;
+  drift?: number | null;            // cosine similarity to canonical char ref, 0..1
+  drift_flagged?: boolean | null;   // true → character may have drifted from ref
 }
 
 export type GenStatus =
@@ -44,6 +65,7 @@ export type GenStatus =
       previewImages?: string[];
       sceneDescriptions?: string[];
       character?: string;
+      keyframes?: KeyframePreview[];
     }
   | { phase: "done"; filename: string; durationS: number }
   | { phase: "error"; message: string }

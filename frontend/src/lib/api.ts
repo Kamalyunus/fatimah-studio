@@ -1,5 +1,5 @@
 import type {
-  HistoryEntry,
+  HistoryEntry, SavedCharacter,
   ImageGenParams, StorybookParams,
 } from "../types";
 
@@ -31,6 +31,15 @@ export const api = {
         preview_images?: string[];
         scene_descriptions?: string[];
         character?: string;
+        keyframes?: Array<{
+          scene_index: number;
+          start_image: string;
+          end_image: string;
+          description?: string;
+          motion_intensity?: string;
+          drift?: number | null;
+          drift_flagged?: boolean | null;
+        }>;
         elapsed_s: number;
       };
       last_error: string | null;
@@ -58,6 +67,49 @@ export const api = {
       body: JSON.stringify(params),
     });
     return jsonOrThrow<{ prompt_id: string; gen_id: string; kind: string }>(r);
+  },
+
+  async storybookApprove() {
+    return fetch(`${BASE}/storybook/approve`, { method: "POST" });
+  },
+  async storybookCancelApproval() {
+    return fetch(`${BASE}/storybook/cancel_approval`, { method: "POST" });
+  },
+  async storybookRegenKeyframe(scene_index: number, frame: "start" | "end") {
+    const r = await fetch(`${BASE}/storybook/regenerate_keyframe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scene_index, frame }),
+    });
+    return jsonOrThrow<{ ok: boolean; filename: string }>(r);
+  },
+  async storybookRegenScene(gen_id: string, scene_index: number) {
+    const r = await fetch(`${BASE}/storybook/regenerate_scene`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gen_id, scene_index }),
+    });
+    return jsonOrThrow<{ ok: boolean; prompt_id: string }>(r);
+  },
+
+  // Character library (re-use protagonist across stories)
+  async listCharacters() {
+    const r = await fetch(`${BASE}/characters`);
+    return jsonOrThrow<{ items: SavedCharacter[] }>(r);
+  },
+  async saveCharacter(name: string, gen_id: string) {
+    const r = await fetch(`${BASE}/characters`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, gen_id }),
+    });
+    return jsonOrThrow<SavedCharacter>(r);
+  },
+  async deleteCharacter(char_id: string) {
+    return fetch(`${BASE}/characters/${char_id}`, { method: "DELETE" });
+  },
+  characterImageUrl(char_id: string) {
+    return `${BASE}/characters/${encodeURIComponent(char_id)}/image`;
   },
 
   async improvePrompt(prompt: string, style?: string) {
