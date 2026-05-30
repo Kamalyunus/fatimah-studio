@@ -31,6 +31,7 @@ export const api = {
         preview_images?: string[];
         scene_descriptions?: string[];
         character?: string;
+        cast?: Array<{ name: string; role: string; species: string; ref_filename: string }>;
         keyframes?: Array<{
           scene_index: number;
           start_image: string;

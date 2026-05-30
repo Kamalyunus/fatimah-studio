@@ -92,6 +92,7 @@ export function OutputPanel() {
         <ApprovalGate
           keyframes={status.phase === "running" ? status.keyframes ?? [] : []}
           character={character}
+          cast={status.phase === "running" ? status.cast ?? [] : []}
         />
       )}
 
@@ -196,7 +197,7 @@ export function OutputPanel() {
  * phase, with regen buttons + Approve / Cancel. While this is mounted the storybook
  * orchestrator is blocked on an asyncio.Event waiting for one of the buttons. */
 function ApprovalGate({
-  keyframes, character,
+  keyframes, character, cast,
 }: {
   keyframes: Array<{
     scene_index: number;
@@ -208,6 +209,7 @@ function ApprovalGate({
     drift_flagged?: boolean | null;
   }>;
   character?: string;
+  cast?: Array<{ name: string; role: string; species: string; ref_filename: string }>;
 }) {
   const flaggedCount = keyframes.filter((k) => k.drift_flagged).length;
   const [busy, setBusy] = useState<string | null>(null); // e.g. "regen-3-end" / "approve"
@@ -269,6 +271,21 @@ function ApprovalGate({
       {character && (
         <div className="text-xs text-fg-muted italic border-l-2 border-brand pl-2 py-0.5">
           <span className="font-semibold not-italic text-fg-base">Main character:</span> {character}
+        </div>
+      )}
+      {cast && cast.length > 1 && (
+        <div className="flex flex-wrap gap-2 items-center">
+          <div className="text-[10px] uppercase tracking-wider text-fg-subtle font-semibold">Cast:</div>
+          {cast.map((c) => (
+            <div key={c.name} className="flex items-center gap-1.5 rounded-full bg-bg-subtle border border-border pl-1 pr-2 py-0.5">
+              <img src={api.imageUrl(c.ref_filename)} alt={c.name}
+                   className="h-6 w-6 rounded-full object-cover bg-bg-muted" loading="lazy" />
+              <div className="text-[11px] font-medium">{c.name}</div>
+              {c.role === "protagonist" && (
+                <div className="text-[9px] text-brand uppercase tracking-wider">lead</div>
+              )}
+            </div>
+          ))}
         </div>
       )}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">

@@ -52,6 +52,13 @@ export interface KeyframePreview {
   drift_flagged?: boolean | null;   // true → character may have drifted from ref
 }
 
+export interface CastMember {
+  name: string;
+  role: string;          // 'protagonist' or 'supporting'
+  species: string;
+  ref_filename: string;  // PNG in ComfyUI's input/ dir
+}
+
 export type GenStatus =
   | { phase: "idle" }
   | { phase: "queued" }
@@ -65,6 +72,7 @@ export type GenStatus =
       previewImages?: string[];
       sceneDescriptions?: string[];
       character?: string;
+      cast?: CastMember[];
       keyframes?: KeyframePreview[];
     }
   | { phase: "done"; filename: string; durationS: number }

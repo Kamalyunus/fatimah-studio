@@ -718,7 +718,7 @@ class StorybookParams(BaseModel):
     user_emoji: str = ""
 
     story: str
-    n_pages: int = 9  # 2..12
+    n_pages: int = 12  # 2..15
     style: str = "pixar"  # pixar | watercolor | anime | cartoon
     aspect: str = "landscape"  # landscape | square | portrait
     # Optional: id of a saved character to re-use across stories. When set, the
@@ -776,7 +776,10 @@ class GenState:
         self.total_steps: int = 0
         self.preview_images: list[str] = []  # storybook: per-page Flux outputs
         self.scene_descriptions: list[str] = []  # storybook: per-page LLM scene descriptions
-        self.character: str = ""  # storybook: LLM-generated character description
+        self.character: str = ""  # storybook: LLM-generated character description (protagonist, prose)
+        # Storybook cast for the UI — list of {name, role, species, ref_filename}.
+        # The orchestrator populates this after the casting phase finishes.
+        self.cast: list[dict] = []
 
         # ----- Storybook keyframe preview gate (#2) -----
         # When the orchestrator finishes generating all Flux start+end pairs, it sets
@@ -803,6 +806,7 @@ class GenState:
             "preview_images": list(self.preview_images),
             "scene_descriptions": list(self.scene_descriptions),
             "character": self.character,
+            "cast": list(self.cast),
             # Lightweight view of the keyframe context for the frontend approval UI —
             # only the filenames + per-scene metadata it actually needs to render.
             "keyframes": [
@@ -1243,6 +1247,87 @@ STORY_ASPECT_DIMS = {
 }
 
 
+def _sanitize_char_name(name: str) -> str:
+    """Lowercase + strip non-alphanumerics so character names become safe filename parts."""
+    return "".join(c.lower() if c.isalnum() else "_" for c in (name or "")).strip("_") or "char"
+
+
+def _build_model_sheet_prompt(canon_clause: str, style_prefix: str) -> str:
+    """Prompt template that asks Flux for a neutral 'character model sheet' headshot —
+    used as the canonical reference image fed to Kontext for that character later."""
+    return (
+        f"Character model sheet: {canon_clause}. "
+        f"Full body shot, neutral standing pose facing forward, plain off-white background, "
+        f"soft even studio lighting, no shadows, no scenery, no other characters. "
+        f"{style_prefix}."
+    )
+
+
+def _composite_refs(
+    char_paths: list[Path],
+    output_path: Path,
+    location_path: Optional[Path] = None,
+) -> None:
+    """Build the Kontext reference image for a scene by concatenating refs side-by-side.
+
+    Layout: [ location (~50% width) | char1 | char2 | ... ]
+
+    Kontext only takes one image; a wide left-to-right strip preserves all the visual
+    cues. Location goes first (left) when supplied so Kontext keys the *setting* off it,
+    then characters. If no location is given, falls back to the old chars-only strip
+    behavior. With one character and no location, the image is copied through verbatim
+    so single-protagonist scenes behave identically to the old single-ref flow."""
+    from PIL import Image
+    if not char_paths and not location_path:
+        raise ValueError("no refs to composite")
+    if not char_paths and location_path:
+        shutil.copyfile(str(location_path), str(output_path))
+        return
+    if len(char_paths) == 1 and location_path is None:
+        # Single character, no location: copy through; equivalent to the old single-ref path.
+        shutil.copyfile(str(char_paths[0]), str(output_path))
+        return
+
+    images: list = []
+    if location_path is not None:
+        images.append(Image.open(location_path).convert("RGB"))
+    images.extend(Image.open(p).convert("RGB") for p in char_paths)
+
+    # Normalise heights so the strip looks coherent
+    target_h = min(img.height for img in images)
+    resized = []
+    for idx, img in enumerate(images):
+        if img.height != target_h:
+            new_w = int(img.width * target_h / img.height)
+            img = img.resize((new_w, target_h), Image.LANCZOS)
+        # Cap the location panel width so a wide landscape location doesn't drown out
+        # the character refs in the composite. Aim for ~50% of the final strip.
+        if idx == 0 and location_path is not None and len(char_paths) >= 1:
+            chars_total_w = 0
+            for j, c in enumerate(images[1:], start=1):
+                cw = int(c.width * target_h / c.height) if c.height != target_h else c.width
+                chars_total_w += cw
+            max_loc_w = max(target_h, chars_total_w)  # cap location at <= total char width
+            if img.width > max_loc_w:
+                # Crop center to max_loc_w (preserves aspect rather than squishing)
+                left = (img.width - max_loc_w) // 2
+                img = img.crop((left, 0, left + max_loc_w, target_h))
+        resized.append(img)
+
+    total_w = sum(img.width for img in resized)
+    combined = Image.new("RGB", (total_w, target_h), (245, 245, 240))
+    x = 0
+    for img in resized:
+        combined.paste(img, (x, 0))
+        x += img.width
+    combined.save(str(output_path), "PNG")
+
+
+# Backward-compat shim — callers that don't have a location still use the same name.
+def _composite_character_refs(ref_paths: list[Path], output_path: Path) -> None:
+    _composite_refs(ref_paths, output_path, location_path=None)
+
+
 async def _submit_comfy_and_wait(workflow: dict, timeout_s: float = 600.0) -> str:
     """Submit a workflow to ComfyUI, poll history until done, return primary output filename."""
     client_id = uuid.uuid4().hex
@@ -1318,10 +1403,21 @@ async def _stitch_videos(paths: list[str], output_path: str, hold_dur: float = 0
         raise RuntimeError(f"ffmpeg stitch failed: {stderr.decode()[:500]}")
 
 
-def _build_wan_prompt(video_prompt: str, starting_pose: str, ending_pose: str,
-                      character: str, style: str) -> str:
-    """Assemble the full Wan prompt from the LLM's per-scene direction. Kept as a small
-    helper so the per-scene regen path can call it without duplicating the template."""
+def _build_wan_prompt(
+    video_prompt: str,
+    starting_pose: str,
+    ending_pose: str,
+    character: str,
+    style: str,
+    motion_timeline: str = "",
+    camera: str = "",
+    location_clause: str = "",
+) -> str:
+    """Assemble the full Wan prompt from the LLM's per-scene direction.
+
+    Wan 2.2 follows timed verbs and camera cues well, so the timeline and camera get
+    woven in explicitly. The location clause anchors the setting so Wan doesn't drift
+    the background across the 5s clip."""
     pose_chain = ""
     if starting_pose and ending_pose:
         pose_chain = (
@@ -1330,9 +1426,21 @@ def _build_wan_prompt(video_prompt: str, starting_pose: str, ending_pose: str,
         )
     elif ending_pose:
         pose_chain = f" The scene ends with {character} {ending_pose}."
+
+    setting = f" Setting: {location_clause}." if location_clause else ""
+    timeline = f" Timeline — {motion_timeline}" if motion_timeline else ""
+    cam = camera.strip().lower() if camera else ""
+    cam_clause = ""
+    if cam and cam != "static":
+        cam_clause = f" Camera: {cam}."
+    elif cam == "static":
+        cam_clause = " Camera: locked, no movement."
+
     return (
-        f"{video_prompt}{pose_chain} {character} "
-        f"Storybook illustration style, {style} aesthetic, soft cinematic lighting, smooth gentle motion."
+        f"{video_prompt}{pose_chain}{setting}{timeline}{cam_clause} "
+        f"{character}. "
+        f"Storybook illustration style, {style} aesthetic, soft cinematic lighting, "
+        f"smooth gentle motion, background remains stable and consistent throughout the shot."
     )
 
 
@@ -1366,10 +1474,9 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
             existing_character=saved_character.get("character") if saved_character else None,
         )
         character = plan.get("character", "")
-        # Render the structured character canon once and reuse it verbatim in every
-        # Flux prompt — Kontext alone can drift on outfit/feature details. Fallback
-        # to the prose `character` field if canon is missing.
-        canon_clause = llm.render_canon(plan.get("character_canon")) or character
+        characters = llm.coerce_characters(plan)
+        protagonist = llm.protagonist_of(characters) or {}
+        locations = llm.coerce_locations(plan)
         scenes = plan.get("scenes") or []
         if not scenes:
             raise RuntimeError("LLM returned no scenes")
@@ -1388,26 +1495,123 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         width, height = STORY_ASPECT_DIMS.get(p.aspect, STORY_ASPECT_DIMS["landscape"])
         seed = int(time.time()) % (2**31)
 
-        # noise_aug per motion intensity: stiller scenes get less Wan freedom (cleaner),
-        # dynamic scenes get more (Wan needs room to invent in-betweens).
         NOISE_AUG_BY_INTENSITY = {"still": 0.0, "gentle": 0.05, "dynamic": 0.10}
-
         kontext_available = (Path("/media/yunus/More Data/comfyui-models/diffusion_models") / FLUX_KONTEXT_MODEL).exists()
-        ref_name = f"storybook_charref_{gen_id}.png"
 
         # Total steps: image + animate per scene; the keyframe preview gate sits between.
         total = len(scenes) * 2
         step_done = 0
 
+        # =================== PHASE 0 — Per-character canonical reference images ===================
+        # Protagonist is NOT pre-generated as a model sheet — that regresses overall
+        # coherency because the neutral-background sheet pulls Kontext toward "studio
+        # portrait" aesthetic and away from the storybook style. Instead, the
+        # protagonist's canonical ref is set to page 1's ACTUAL scene render below
+        # (matches what worked in the single-character version).
+        #
+        # Supporting characters DO get model sheets here, because we need *some* visual
+        # anchor for them before they appear, and we don't have a scene-render to use.
+        # These sheets feed only into the composite for scenes where they appear.
+        protagonist_name = (protagonist.get("name") or "").strip()
+        char_refs: dict[str, str] = {}
+        legacy_ref_name = f"storybook_charref_{gen_id}.png"
+
+        if saved_character and protagonist_name:
+            # Saved-character flow: use the saved ref as the protagonist's canonical ref
+            # immediately, so the composite for page 1 already has the locked character.
+            src = CHARACTER_LIBRARY_DIR / saved_character["ref_filename"]
+            ref_filename = f"char_ref_{_sanitize_char_name(protagonist_name)}_{gen_id}.png"
+            shutil.copyfile(str(src), str(COMFY_INPUT / ref_filename))
+            shutil.copyfile(str(src), str(COMFY_INPUT / legacy_ref_name))
+            char_refs[protagonist_name] = ref_filename
+
+        # Supporting characters: one model-sheet Flux T2I each, used in composites.
+        supporting_count = 0
+        for char in characters:
+            name = (char.get("name") or "").strip()
+            if not name or char.get("role") == "protagonist":
+                continue
+            if _active_gen is not None:
+                _active_gen.node = f"casting-{name}"
+            ref_filename = f"char_ref_{_sanitize_char_name(name)}_{gen_id}.png"
+            clause = llm.render_canon(char) or name
+            prompt = _build_model_sheet_prompt(clause, style_prefix)
+            wf_ref = build_flux_image_workflow(ImageGenerateParams(
+                image_mode="create", prompt=prompt,
+                width=width, height=height,
+                seed=seed + abs(hash(name)) % 100000,
+                model="flux",
+            ))
+            ref_out = await _submit_comfy_and_wait(wf_ref, timeout_s=300)
+            shutil.copyfile(str(COMFY_OUTPUT / ref_out), str(COMFY_INPUT / ref_filename))
+            char_refs[name] = ref_filename
+            supporting_count += 1
+
+        # Publish the cast (so far — protagonist gets a placeholder until page 1 lands).
+        if _active_gen is not None:
+            _active_gen.cast = [
+                {
+                    "name": (c.get("name") or "").strip(),
+                    "role": c.get("role") or "supporting",
+                    "species": c.get("species") or "",
+                    "ref_filename": char_refs.get((c.get("name") or "").strip(), ""),
+                }
+                for c in characters
+                if (c.get("name") or "").strip()
+            ]
+
+        # =================== PHASE 0.5 — Per-location canonical reference images ===================
+        # One Flux T2I per UNIQUE location the story passes through. These get composited
+        # into the Kontext reference for every scene set in that location, so the
+        # background reads identically across scenes (the fix for "environment changes
+        # abruptly"). Locations referenced by zero scenes are skipped to save Flux calls.
+        loc_refs: dict[str, str] = {}
+        used_loc_ids = {(s.get("location_id") or "").strip() for s in scenes}
+        used_loc_ids.discard("")
+        for loc in locations:
+            lid = loc.get("id") or ""
+            if lid not in used_loc_ids:
+                continue
+            if _active_gen is not None:
+                _active_gen.node = f"location-{lid}"
+            loc_filename = f"loc_ref_{_sanitize_char_name(lid)}_{gen_id}.png"
+            loc_clause = llm.render_location(loc) or lid
+            loc_prompt = (
+                f"{style_prefix}. Wide establishing shot of {loc_clause}. "
+                f"Empty environment — no characters, no people, no animals. "
+                f"Soft cinematic lighting, rich background detail, coherent palette."
+            )
+            wf_loc = build_flux_image_workflow(ImageGenerateParams(
+                image_mode="create", prompt=loc_prompt,
+                width=width, height=height,
+                seed=seed + abs(hash(lid)) % 100000,
+                model="flux",
+            ))
+            loc_out = await _submit_comfy_and_wait(wf_loc, timeout_s=300)
+            shutil.copyfile(str(COMFY_OUTPUT / loc_out), str(COMFY_INPUT / loc_filename))
+            loc_refs[lid] = loc_filename
+
         # =================== PHASE A — Generate all Flux start+end pairs ===================
         # We do this in one pass so the user can preview every keyframe before committing
-        # to the heavy Wan phase.
+        # to the heavy Wan phase. Every keyframe runs through Flux Kontext with a
+        # composite reference image built from the characters present in that scene —
+        # this is what locks supporting characters' appearance across scenes.
         prev_end_image_filename: Optional[str] = None
         for i, scene in enumerate(scenes):
             scene_desc = scene.get("description") or "A scene from the story."
             starting_pose = scene.get("starting_pose") or ""
             ending_pose = scene.get("ending_pose") or ""
             intensity = (scene.get("motion_intensity") or "gentle").lower()
+            chars_in_scene = scene.get("characters_in_scene") or ([protagonist_name] if protagonist_name else [])
+            # Location resolution: scene tags a location_id; we look up the canon and the
+            # pre-generated ref. Fall back gracefully if the LLM emitted an unknown id.
+            loc_id = (scene.get("location_id") or "").strip()
+            loc_obj = llm.location_by_id(locations, loc_id) if loc_id else None
+            loc_clause = llm.render_location(loc_obj)
+            loc_ref_filename = loc_refs.get(loc_id) or ""
+            prev_link = (scene.get("prev_link") or "").strip()
+            motion_timeline = (scene.get("motion_timeline") or "").strip()
+            camera = (scene.get("camera") or "static").strip()
 
             if _active_gen is not None:
                 _active_gen.node = f"page-{i+1}-image"
@@ -1417,54 +1621,142 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
             start_image_input_name = f"storybook_start_p{i}_{gen_id}.png"
             end_image_input_name = f"storybook_end_p{i}_{gen_id}.png"
 
+            # Per-scene canon clause (text-level): lists every character present + their canon.
+            # This is the load-bearing piece for supporting-character consistency since
+            # Flux follows text strongly.
+            scene_canon = llm.render_cast(characters, names=chars_in_scene) or (character or "")
+
             # ---- START image ----
-            # Page 1: fresh Flux gen (or saved-character reference). Pages 2+: byte-perfect
-            # copy of the previous page's end image (so cuts are invisible at stitch time).
+            # Page 1: plain Flux T2I (no Kontext) so the protagonist's canonical look is
+            # established by a real scene render — the OLD working behavior. That image
+            # then becomes the protagonist's canonical ref for every later Kontext call.
+            # Pages 2+: byte-perfect copy of the previous page's end image (so cuts are
+            # invisible at stitch time).
+            multi_char = len(chars_in_scene) > 1
+            setting_clause = f"Setting: {loc_clause}. " if loc_clause else ""
             start_prompt = ""
             if i == 0:
                 start_pose_text = starting_pose or "in an initial settled pose"
+                # For single-character scenes, only describe the protagonist — pluralised
+                # phrasing tends to make Flux invent extra companions out of thin air.
+                cast_clause = scene_canon if multi_char else (llm.render_canon(protagonist) or character)
+                start_prompt = (
+                    f"{style_prefix}. {setting_clause}{cast_clause}. {scene_desc}. "
+                    f"{character} is {start_pose_text}."
+                )
                 if saved_character:
-                    saved_ref = CHARACTER_LIBRARY_DIR / saved_character["ref_filename"]
-                    shutil.copyfile(str(saved_ref), str(COMFY_INPUT / start_image_input_name))
-                    shutil.copyfile(str(saved_ref), str(COMFY_INPUT / ref_name))
-                    page1_seed_name = f"saved_char_p0_{gen_id}.png"
-                    shutil.copyfile(str(saved_ref), str(COMFY_OUTPUT / page1_seed_name))
-                    page_thumb = page1_seed_name
+                    # Saved-character flow: the saved ref IS the protagonist's canonical
+                    # look, so use it as a Kontext ref for page 1 (single character) —
+                    # this anchors the saved appearance into the scene properly.
+                    proto_ref = char_refs.get(protagonist_name, legacy_ref_name)
+                    if kontext_available and (COMFY_INPUT / proto_ref).exists():
+                        wf = build_flux_kontext_workflow(
+                            prompt=start_prompt, width=width, height=height,
+                            seed=seed, reference_image=proto_ref, steps=20,
+                        )
+                    else:
+                        wf = build_flux_image_workflow(ImageGenerateParams(
+                            image_mode="create", prompt=start_prompt,
+                            width=width, height=height, seed=seed, model="flux",
+                        ))
                 else:
-                    start_prompt = (
-                        f"{style_prefix}. {canon_clause}. {scene_desc}. "
-                        f"{character} is {start_pose_text}."
-                    )
                     wf = build_flux_image_workflow(ImageGenerateParams(
                         image_mode="create", prompt=start_prompt,
                         width=width, height=height, seed=seed, model="flux",
                     ))
-                    start_out = await _submit_comfy_and_wait(wf, timeout_s=300)
-                    shutil.copyfile(str(COMFY_OUTPUT / start_out), str(COMFY_INPUT / start_image_input_name))
-                    shutil.copyfile(str(COMFY_OUTPUT / start_out), str(COMFY_INPUT / ref_name))
-                    page_thumb = start_out
+                start_out = await _submit_comfy_and_wait(wf, timeout_s=300)
+                shutil.copyfile(str(COMFY_OUTPUT / start_out), str(COMFY_INPUT / start_image_input_name))
+                # Page 1's render becomes the protagonist's canonical ref for the rest of
+                # the book — this matches the old, working single-character flow.
+                if protagonist_name and not saved_character:
+                    proto_ref_filename = f"char_ref_{_sanitize_char_name(protagonist_name)}_{gen_id}.png"
+                    shutil.copyfile(str(COMFY_OUTPUT / start_out), str(COMFY_INPUT / proto_ref_filename))
+                    char_refs[protagonist_name] = proto_ref_filename
+                    # Keep the legacy ref filename in sync for the save-character endpoint.
+                    shutil.copyfile(str(COMFY_OUTPUT / start_out), str(COMFY_INPUT / legacy_ref_name))
+                    # Update the cast entry's ref so the UI chip points at the right image
+                    if _active_gen is not None:
+                        for entry in _active_gen.cast:
+                            if entry["name"] == protagonist_name:
+                                entry["ref_filename"] = proto_ref_filename
+                                break
+                page_thumb = start_out
             else:
                 shutil.copyfile(str(COMFY_OUTPUT / prev_end_image_filename), str(COMFY_INPUT / start_image_input_name))
                 page_thumb = prev_end_image_filename
             if _active_gen is not None:
                 _active_gen.preview_images.append(page_thumb)
 
+            # ---- Composite reference for THIS scene (now that protagonist ref is set) ----
+            # Kontext can only take one image, so we concatenate the relevant refs into a
+            # single strip: [ location | char1 | char2 | ... ]. The location panel is what
+            # locks the background across the scene; the character panels lock appearance.
+            ref_paths_this_scene = [
+                COMFY_INPUT / char_refs[n] for n in chars_in_scene if n in char_refs
+            ]
+            loc_ref_path: Optional[Path] = None
+            if loc_ref_filename and (COMFY_INPUT / loc_ref_filename).exists():
+                loc_ref_path = COMFY_INPUT / loc_ref_filename
+            composite_ref_name = f"composite_p{i}_{gen_id}.png"
+            try:
+                if ref_paths_this_scene or loc_ref_path:
+                    _composite_refs(
+                        ref_paths_this_scene,
+                        COMFY_INPUT / composite_ref_name,
+                        location_path=loc_ref_path,
+                    )
+                elif (COMFY_INPUT / legacy_ref_name).exists():
+                    shutil.copyfile(str(COMFY_INPUT / legacy_ref_name), str(COMFY_INPUT / composite_ref_name))
+            except Exception as e:
+                print(f"[storybook] composite ref build failed for page {i+1}: {e}")
+                composite_ref_name = legacy_ref_name
+
+            use_kontext = kontext_available and (COMFY_INPUT / composite_ref_name).exists()
+
             # ---- END image (Wan FLF2V target) ----
+            # Kontext with the composite reference. Lead with the pose change so Kontext
+            # doesn't just reproduce the reference image verbatim. The location panel of
+            # the composite anchors the background; the text leads with setting so Kontext
+            # also keys the *style* of the location off the reference. Switch between
+            # singular and plural phrasing so Flux doesn't invent extra characters in
+            # protagonist-only scenes.
             end_pose_text = ending_pose or starting_pose or "in a settled, restful pose"
-            end_prompt = (
-                f"{character} {end_pose_text}. "
-                f"{scene_desc}. {style_prefix}. "
-                f"Character canon (must match exactly): {canon_clause}. "
-                f"The character's appearance matches the reference exactly, "
-                f"but the pose, body position, and gesture are clearly different from the reference."
+            proto_clause = llm.render_canon(protagonist) or (character or "")
+            setting_lock = (
+                f"Setting (must match the location panel of the reference exactly): {loc_clause}. "
+                if loc_clause else ""
             )
+            link_clause = (
+                f"Narrative continuity: {prev_link} " if prev_link and i > 0 else ""
+            )
+            if multi_char:
+                end_prompt = (
+                    f"{character} {end_pose_text}. "
+                    f"{scene_desc}. {style_prefix}. "
+                    f"{setting_lock}"
+                    f"{link_clause}"
+                    f"Protagonist (must match the reference exactly): {proto_clause}. "
+                    f"Other characters present: {scene_canon}. "
+                    f"Every character keeps their appearance from the reference, but their "
+                    f"poses, positions, and gestures are clearly different from the reference."
+                )
+            else:
+                end_prompt = (
+                    f"{character} {end_pose_text}. "
+                    f"{scene_desc}. {style_prefix}. "
+                    f"{setting_lock}"
+                    f"{link_clause}"
+                    f"The character must match the reference exactly: {proto_clause}. "
+                    f"The character's appearance is identical to the reference, but their "
+                    f"pose, body position, and gesture are clearly different from the reference."
+                )
             end_seed = seed + i * 100 + 7
             wf_end = (
                 build_flux_kontext_workflow(
                     prompt=end_prompt, width=width, height=height,
-                    seed=end_seed, reference_image=ref_name, steps=20,
+                    seed=end_seed, reference_image=composite_ref_name, steps=20,
                 )
-                if kontext_available and (COMFY_INPUT / ref_name).exists()
+                if use_kontext
                 else build_flux_image_workflow(ImageGenerateParams(
                     image_mode="create", prompt=end_prompt,
                     width=width, height=height, seed=end_seed, model="flux",
@@ -1486,12 +1778,22 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                     "end_input_name": end_image_input_name,
                     "description": scene_desc,
                     "motion_intensity": intensity,
-                    "start_prompt": start_prompt,   # empty for page 1 when saved_character is used
+                    "start_prompt": start_prompt,
                     "end_prompt": end_prompt,
                     "end_seed": end_seed,
+                    "composite_ref": composite_ref_name,   # used by keyframe-regen + drift rescore
+                    "characters_in_scene": list(chars_in_scene),
+                    "location_id": loc_id,
+                    "location_clause": loc_clause,
+                    "prev_link": prev_link,
+                    "motion_timeline": motion_timeline,
+                    "camera": camera,
                     "wan_prompt": _build_wan_prompt(
                         scene.get("video_prompt") or scene.get("motion") or "gentle motion",
                         starting_pose, ending_pose, character, p.style,
+                        motion_timeline=motion_timeline,
+                        camera=camera,
+                        location_clause=loc_clause,
                     ),
                 })
             step_done += 1
@@ -1501,7 +1803,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         # attach the cosine similarity to its keyframe entry, so the UI can flag scenes
         # whose character has drifted (per #4). Runs on CPU; takes a second or two.
         try:
-            ref_path = COMFY_INPUT / ref_name
+            ref_path = COMFY_INPUT / legacy_ref_name
             scene_paths = [COMFY_OUTPUT / kf["start_image"] for kf in _active_gen.keyframes] if _active_gen else []
             if _active_gen and ref_path.exists() and scene_paths:
                 sims = await drift.score_drift(ref_path, scene_paths)
@@ -1578,8 +1880,20 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 "wan_prompt": kf["wan_prompt"],
                 "motion_intensity": kf["motion_intensity"],
                 "description": kf["description"],
+                "composite_ref": kf.get("composite_ref"),
+                "characters_in_scene": kf.get("characters_in_scene", []),
+                "location_id": kf.get("location_id", ""),
+                "location_clause": kf.get("location_clause", ""),
+                "prev_link": kf.get("prev_link", ""),
+                "motion_timeline": kf.get("motion_timeline", ""),
+                "camera": kf.get("camera", ""),
             }
             for kf in (_active_gen.keyframes if _active_gen else [])
+        ]
+        locations_records = [
+            {"id": l.get("id"), "name": l.get("name"), "description": l.get("description"),
+             "ref_filename": loc_refs.get(l.get("id") or "", "")}
+            for l in locations if (l.get("id") or "") in {r["location_id"] for r in scene_records if r.get("location_id")}
         ]
         items = _load_json(HISTORY_FILE, [])
         items = [it for it in items if it.get("prompt_id") != prompt_id]
@@ -1595,6 +1909,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 "plan": plan,
                 "page_videos": [os.path.basename(v) for v in page_videos],
                 "scenes_meta": scene_records,
+                "locations_meta": locations_records,
                 "width": width,
                 "height": height,
                 "seed": seed,
@@ -1619,8 +1934,8 @@ async def storybook(p: StorybookParams):
         raise HTTPException(503, "backend not ready")
     if not p.story.strip():
         raise HTTPException(400, "story is required")
-    if p.n_pages < 2 or p.n_pages > 12:
-        raise HTTPException(400, "n_pages must be 2..12")
+    if p.n_pages < 2 or p.n_pages > 15:
+        raise HTTPException(400, "n_pages must be 2..15")
     if not await llm.is_available():
         raise HTTPException(503, "Local LLM (Ollama llama3.2:3b) is not available. Start ollama and pull the model.")
     async with _state_lock:
@@ -1688,14 +2003,15 @@ async def storybook_regenerate_keyframe(p: RegenerateKeyframeParams):
         raise HTTPException(400, "page 2+ start frames are byte-perfect copies of the previous end; regen that end frame instead")
 
     kf = keyframes[p.scene_index]
-    gen_id = _active_gen.gen_id
     params = _active_gen.params or {}
     width = STORY_ASPECT_DIMS.get(params.get("aspect", "landscape"), STORY_ASPECT_DIMS["landscape"])[0]
     height = STORY_ASPECT_DIMS.get(params.get("aspect", "landscape"), STORY_ASPECT_DIMS["landscape"])[1]
-    ref_name = f"storybook_charref_{gen_id}.png"
+    # Use the same composite reference this scene was originally generated with so the
+    # cast stays visually consistent on regen.
+    composite_ref = kf.get("composite_ref") or f"storybook_charref_{_active_gen.gen_id}.png"
     kontext_available = (
         Path("/media/yunus/More Data/comfyui-models/diffusion_models") / FLUX_KONTEXT_MODEL
-    ).exists() and (COMFY_INPUT / ref_name).exists()
+    ).exists() and (COMFY_INPUT / composite_ref).exists()
 
     new_seed = int(time.time() * 1000) % (2**31)
     await _comfy_free()
@@ -1703,13 +2019,19 @@ async def storybook_regenerate_keyframe(p: RegenerateKeyframeParams):
         prompt_text = kf.get("start_prompt") or ""
         if not prompt_text:
             raise HTTPException(409, "this start frame is from a saved character and cannot be regenerated")
-        wf = build_flux_image_workflow(ImageGenerateParams(
-            image_mode="create", prompt=prompt_text,
-            width=width, height=height, seed=new_seed, model="flux",
-        ))
+        wf = (
+            build_flux_kontext_workflow(
+                prompt=prompt_text, width=width, height=height,
+                seed=new_seed, reference_image=composite_ref, steps=20,
+            )
+            if kontext_available
+            else build_flux_image_workflow(ImageGenerateParams(
+                image_mode="create", prompt=prompt_text,
+                width=width, height=height, seed=new_seed, model="flux",
+            ))
+        )
         out = await _submit_comfy_and_wait(wf, timeout_s=300)
         shutil.copyfile(str(COMFY_OUTPUT / out), str(COMFY_INPUT / kf["start_input_name"]))
-        shutil.copyfile(str(COMFY_OUTPUT / out), str(COMFY_INPUT / ref_name))
         kf["start_image"] = out
         if _active_gen.preview_images:
             _active_gen.preview_images[0] = out
@@ -1720,7 +2042,7 @@ async def storybook_regenerate_keyframe(p: RegenerateKeyframeParams):
         wf = (
             build_flux_kontext_workflow(
                 prompt=prompt_text, width=width, height=height,
-                seed=new_seed, reference_image=ref_name, steps=20,
+                seed=new_seed, reference_image=composite_ref, steps=20,
             )
             if kontext_available
             else build_flux_image_workflow(ImageGenerateParams(

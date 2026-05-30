@@ -20,9 +20,9 @@ const STYLES: Array<{ key: Style; label: string; emoji: string; hint: string }> 
 // target duration; n_pages is derived by dividing by 5.
 const SECONDS_PER_SCENE = 5;
 const DURATION_OPTIONS = [
-  { seconds: 30, label: "Short",  hint: "~55 min to make" },
-  { seconds: 45, label: "Medium", hint: "~80 min to make" },
-  { seconds: 60, label: "Long",   hint: "~105 min to make" },
+  { seconds: 45, label: "Short",  hint: "~80 min to make" },
+  { seconds: 60, label: "Medium", hint: "~105 min to make" },
+  { seconds: 75, label: "Long",   hint: "~130 min to make" },
 ];
 
 const STORY_SAMPLES = [
@@ -35,7 +35,7 @@ const STORY_SAMPLES = [
 export function StorybookPanel() {
   const { status, busyByOther, generateStorybook, cancel } = useStudio();
   const [story, setStory] = useState("");
-  const [durationSec, setDurationSec] = useState<number>(45);
+  const [durationSec, setDurationSec] = useState<number>(60);
   const [style, setStyle] = useState<Style>("pixar");
   const [aspect, setAspect] = useState<Aspect>("landscape");
   const [characters, setCharacters] = useState<SavedCharacter[]>([]);

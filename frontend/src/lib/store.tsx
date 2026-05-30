@@ -227,6 +227,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         previewImages: a.preview_images,
         sceneDescriptions: a.scene_descriptions,
         character: a.character,
+        cast: a.cast,
         keyframes: a.keyframes,
       };
     }

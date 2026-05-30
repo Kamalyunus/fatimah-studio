@@ -59,62 +59,89 @@ _STORY_SYSTEM = (
     "into the next, with the character's body position carrying continuity between pages.\n\n"
     "Return STRICT JSON with this shape (no markdown, no commentary):\n"
     "{\n"
-    "  \"character\": \"<two-sentence description: name, species, colors, distinctive features, clothing, mood. Detailed visual canon reused for every page.>\",\n"
-    "  \"character_canon\": {\n"
-    "    \"name\":      \"<character's name>\",\n"
-    "    \"species\":   \"<species or kind: 'a small grey kitten', 'a friendly toy robot', 'a 6-year-old girl with curly red hair'>\",\n"
-    "    \"colors\":    \"<key colors: 'soft grey fur with white paws and a pink nose'>\",\n"
-    "    \"features\":  \"<distinctive features: 'big amber eyes, small white star on forehead, chipped left ear'>\",\n"
-    "    \"clothing\":  \"<exact outfit if any: 'red wool sweater with a yellow star, blue overalls, no shoes'. Use empty string if none.>\",\n"
-    "    \"accessories\": \"<persistent objects the character carries: 'a tiny leather satchel, a wooden flute'. Empty string if none.>\"\n"
-    "  },\n"
+    "  \"character\": \"<two-sentence description of the PROTAGONIST: name, species, colors, distinctive features, clothing. Mirrors `characters[0]` below — kept as prose for UI display.>\",\n"
+    "  \"characters\": [\n"
+    "    {\n"
+    "      \"name\":        \"<character's name (unique per character)>\",\n"
+    "      \"role\":        \"protagonist\",  // EXACTLY ONE entry must have role='protagonist'; everyone else is 'supporting'\n"
+    "      \"species\":     \"<species or kind: 'a small grey kitten', 'a 6-year-old boy with curly red hair', 'a friendly toy robot'>\",\n"
+    "      \"colors\":      \"<key colors: 'soft grey fur with white paws and a pink nose'>\",\n"
+    "      \"features\":    \"<distinctive features: 'big amber eyes, small white star on forehead, chipped left ear'>\",\n"
+    "      \"clothing\":    \"<exact outfit, or empty string>\",\n"
+    "      \"accessories\": \"<persistent objects the character carries, or empty string>\"\n"
+    "    }\n"
+    "    // Add a `supporting` character object for EACH other recurring character in the story.\n"
+    "  ],\n"
+    "  \"locations\": [\n"
+    "    {\n"
+    "      \"id\":          \"<short kebab-case identifier, e.g. 'kitchen', 'meadow', 'rocket-cockpit'. Used to tag scenes; must be unique.>\",\n"
+    "      \"name\":        \"<human-friendly name, e.g. 'Mochi's kitchen', 'the sunny meadow'>\",\n"
+    "      \"description\": \"<rich one-sentence visual description: architecture, materials, dominant colors, lighting quality, key props, time of day. This is used to paint the canonical reference of the empty environment; be concrete and visual, no characters.>\"\n"
+    "    }\n"
+    "    // Include EVERY distinct setting that any scene takes place in. Aim for the smallest set possible — reuse `id`s across scenes that share a setting.\n"
+    "  ],\n"
     "  \"scenes\": [\n"
     "    {\n"
-    "      \"starting_pose\": \"<concise description of the character's body position + expression at the FIRST frame of this scene. Examples: 'standing by the window, hand on the glass, looking out', 'sitting on a log, eyes closed, smiling'. THIS MUST MATCH the previous scene's `ending_pose` word-for-word (continuity). For scene 1 this sets the opening pose.>\",\n"
-    "      \"ending_pose\": \"<concise description of the character's body position + expression at the LAST frame of this scene. Same vocabulary style as starting_pose. This becomes the next scene's starting_pose.>\",\n"
-    "      \"description\": \"<one-sentence visual description of the still image, MUST include the starting_pose so Flux paints the character in that exact pose. Composition, setting. Reference character by name.>\",\n"
-    "      \"motion\": \"<short: what the character does. Must take character from starting_pose to ending_pose in one continuous arc.>\",\n"
-    "      \"video_prompt\": \"<CONCISE cinematic direction for ONE simple motion (25-45 words). Name: (1) shot framing (close-up / medium / wide / overhead), (2) one short motion arc from starting_pose to ending_pose with manner (slowly, gently, eagerly), (3) one ambient detail (leaves drifting, steam rising). Avoid stacking multiple actions. The motion is gentle and completes within ~5 seconds.>\",\n"
-    "      \"motion_intensity\": \"<one of: 'still' (sitting, blinking, breathing), 'gentle' (waving, turning head, reaching), 'dynamic' (jumping, running steps, throwing). Default to 'gentle' if unsure.>\"\n"
+    "      \"location_id\":   \"<must match one of the `id`s in `locations`. Consecutive scenes should share the same id unless this is an explicit transit scene.>\",\n"
+    "      \"starting_pose\": \"<concise description of the protagonist's body position + expression at the FIRST frame of this scene. Examples: 'standing by the window, hand on the glass, looking out', 'sitting on a log, eyes closed, smiling'. THIS MUST MATCH the previous scene's `ending_pose` word-for-word (continuity). For scene 1 this sets the opening pose.>\",\n"
+    "      \"ending_pose\":   \"<concise description of the protagonist's body position + expression at the LAST frame of this scene. Same vocabulary style as starting_pose. This becomes the next scene's starting_pose.>\",\n"
+    "      \"prev_link\":     \"<ONE short sentence describing how this scene picks up from the previous one. Reference the previous setting/action by name so the visual continuity is explicit. Example: 'Picks up the instant after Mochi opens the kitchen door — she is now stepping onto the meadow grass, the doorway visible behind her.' For scene 1, write 'Opening scene.'>\",\n"
+    "      \"description\":   \"<one-sentence visual description of the still image, MUST include the protagonist's starting_pose so Flux paints them in that exact pose. Composition, setting (consistent with the location's description). Reference all named characters present.>\",\n"
+    "      \"motion\":        \"<short: what the protagonist does. Must take them from starting_pose to ending_pose in one continuous arc.>\",\n"
+    "      \"motion_timeline\": \"<verb-and-timing breakdown of the ~5s clip in the form '0-2s: <verb phrase>. 2-4s: <verb phrase>. 4-5s: <verb phrase>.' Each beat is ONE concrete verb, not a list. Wan follows timed verbs reliably.>\",\n"
+    "      \"camera\":        \"<one of: 'static', 'slow dolly in', 'slow dolly out', 'slow pan left', 'slow pan right', 'slow tilt up', 'slow tilt down'. Pick the one that supports the moment; default to 'static' if unsure.>\",\n"
+    "      \"video_prompt\":  \"<CONCISE cinematic direction for ONE simple motion (25-45 words). Name: (1) shot framing (close-up / medium / wide / overhead), (2) one short motion arc from starting_pose to ending_pose with manner (slowly, gently, eagerly), (3) one ambient detail (leaves drifting, steam rising). Avoid stacking multiple actions.>\",\n"
+    "      \"motion_intensity\": \"<one of: 'still' (sitting, blinking, breathing), 'gentle' (waving, turning head, reaching), 'dynamic' (jumping, running steps, throwing). Default to 'gentle' if unsure.>\",\n"
+    "      \"characters_in_scene\": [\"<exact character name>\", ...]  // ALWAYS include the protagonist. Include supporting characters ONLY when physically visible.\n"
     "    }\n"
     "  ]\n"
     "}\n\n"
     "Generate EXACTLY the number of scenes requested.\n\n"
     "Critical rules:\n"
-    "1. POSE CONTINUITY: scene[i].starting_pose MUST equal scene[i-1].ending_pose word-for-word. Plan all `ending_pose` and `starting_pose` first so they chain.\n"
-    "2. SETTING CONTINUITY: consecutive scenes MUST stay in the same physical setting (same room, same hill, same beach) unless a dedicated transit scene moves the character. Each scene's `description` should keep the environment from the previous scene — the camera and lighting can change, but the place does not jump.\n"
-    "   - BAD: scene 3 is 'in the kitchen', scene 4 is 'in the meadow'. Background teleport → rushed feel.\n"
-    "   - GOOD: scene 3 ends with 'opening the kitchen door, looking out at the meadow'. Scene 4 begins 'stepping onto the meadow grass'. The transit IS its own scene.\n"
-    "   - Plan setting changes as deliberate transit beats: 'opens door', 'walks through gate', 'climbs into the spaceship'. Never skip them.\n"
-    "3. The image (`description`) AND the video (`video_prompt`) must both reflect the starting_pose, so the first frame of the animation matches the previous page's last frame.\n"
-    "4. ONE primary action per scene. Resist packing multiple beats into one scene — if a moment has steps (e.g. 'open the door AND step out AND look up'), that is THREE scenes, not one. Use simple verbs.\n"
-    "5. The pose change from starting_pose to ending_pose should be small enough to render in ~5 seconds of natural motion (a tilt of the head, a hand reaching out, taking two steps). Avoid full-body locomotion arcs within one scene.\n"
-    "6. Every video_prompt traverses from starting_pose to ending_pose — no mid-action cliffhangers.\n"
-    "7. Child-friendly. Slow/subtle camera moves only (or none)."
+    "1. POSE CONTINUITY: scene[i].starting_pose MUST equal scene[i-1].ending_pose word-for-word.\n"
+    "2. LOCATIONS as FIRST-CLASS ENTITIES: enumerate every distinct setting in `locations` with a concrete visual description. Each scene gets `location_id` pointing into that list. REUSE ids whenever scenes share a setting — the same kitchen across 4 scenes is ONE location entry, not four.\n"
+    "3. SETTING CONTINUITY: consecutive scenes should share the SAME `location_id` unless there's a dedicated TRANSIT scene moving the character from A to B. The transit beat is its own scene with its own location_id ('doorway', 'corridor', 'meadow-edge') and uses scene budget. Never cut directly from location A to location B with no transit.\n"
+    "   - BAD: scene 3 location_id='kitchen', scene 4 location_id='meadow'. Background teleport.\n"
+    "   - GOOD: scene 3 ends 'opening the kitchen door, looking out'. Scene 4 location_id='kitchen-doorway' shows stepping through. Scene 5 location_id='meadow'.\n"
+    "4. NARRATIVE CONTINUITY (`prev_link`): every scene's prev_link must explicitly name the previous scene's ending state or location, so the new image obviously continues from the last one — not a hard cut.\n"
+    "5. CHARACTER ROSTER: include every recurring character in `characters`; each scene's `characters_in_scene` lists ONLY characters PHYSICALLY VISIBLE. Many scenes will be protagonist-only.\n"
+    "6. The image (`description`) AND the video (`video_prompt`) must both reflect the protagonist's starting_pose, so the first frame of the animation matches the previous page's last frame.\n"
+    "7. ONE primary action per scene. Use the `motion_timeline` to break the 5s into 2-3 small verb beats — that is your single action, decomposed in time, NOT three separate actions. Resist packing multiple distinct actions.\n"
+    "8. The pose change from starting_pose to ending_pose should be small enough to render in ~5 seconds (a tilt of the head, a hand reaching, two steps). Avoid full-body locomotion arcs.\n"
+    "9. Child-friendly. Slow camera only."
 )
 
 _OUTLINE_SYSTEM = (
     "You are a children's story editor planning the narrative SKELETON of a short illustrated "
-    "video before any scene-level writing. You return a tight outline with story beats and "
-    "the number of scenes each beat will use.\n\n"
+    "video before any scene-level writing. You return a tight outline with story beats, the "
+    "number of scenes each beat uses, AND the set of distinct settings the story moves through.\n\n"
     "Return STRICT JSON with this shape (no markdown, no commentary):\n"
     "{\n"
-    "  \"title\": \"<short title>\",\n"
+    "  \"title\":     \"<short title>\",\n"
     "  \"character\": \"<two-sentence character description — same canon used later>\",\n"
+    "  \"locations\": [\n"
+    "    {\n"
+    "      \"id\":   \"<short kebab-case id, e.g. 'kitchen', 'meadow', 'cave-entrance'>\",\n"
+    "      \"name\": \"<human-friendly name>\",\n"
+    "      \"description\": \"<one rich visual sentence: architecture, materials, dominant colors, lighting, key props, time of day. No characters.>\"\n"
+    "    }\n"
+    "  ],\n"
     "  \"beats\": [\n"
-    "    {\"name\": \"setup\",      \"summary\": \"<who, where, what's normal>\",          \"scenes\": <int>},\n"
-    "    {\"name\": \"inciting\",   \"summary\": \"<what disrupts the normal>\",            \"scenes\": <int>},\n"
-    "    {\"name\": \"rising\",     \"summary\": \"<the main attempt or journey>\",         \"scenes\": <int>},\n"
-    "    {\"name\": \"climax\",     \"summary\": \"<the key moment of change>\",            \"scenes\": <int>},\n"
-    "    {\"name\": \"resolution\", \"summary\": \"<how things settle, what the character feels at the end>\", \"scenes\": <int>}\n"
+    "    {\"name\": \"setup\",      \"summary\": \"<who, where, what's normal>\",          \"location_id\": \"<id>\", \"scenes\": <int>},\n"
+    "    {\"name\": \"inciting\",   \"summary\": \"<what disrupts the normal>\",            \"location_id\": \"<id>\", \"scenes\": <int>},\n"
+    "    {\"name\": \"rising\",     \"summary\": \"<the main attempt or journey>\",         \"location_id\": \"<id>\", \"scenes\": <int>},\n"
+    "    {\"name\": \"climax\",     \"summary\": \"<the key moment of change>\",            \"location_id\": \"<id>\", \"scenes\": <int>},\n"
+    "    {\"name\": \"resolution\", \"summary\": \"<how things settle, what the character feels at the end>\", \"location_id\": \"<id>\", \"scenes\": <int>}\n"
     "  ]\n"
     "}\n\n"
     "Constraints:\n"
     "- Total of `scenes` across all beats must EQUAL the requested number of scenes exactly.\n"
     "- Allocate scenes proportionally — setup and resolution often need only 1 scene each; "
     "rising-action gets the most. Climax is usually 1-2 scenes.\n"
-    "- Each beat lives in ONE primary setting; transit between settings happens within "
-    "rising-action and counts as scenes of that beat.\n"
+    "- Each beat lives in ONE primary `location_id`. If a beat crosses settings, it must have "
+    "≥2 scenes (the extras are transit scenes that get their own location ids).\n"
+    "- Keep `locations` SMALL — typically 2-5 entries. Re-use the same id across beats whenever "
+    "the story returns to that setting. Don't proliferate per-scene locations.\n"
     "- Child-friendly, gentle pacing. No conflict beyond mild challenge."
 )
 
@@ -122,24 +149,31 @@ _CRITIQUE_SYSTEM = (
     "You are a senior storyboard editor reviewing a draft children's animated picture-book plan. "
     "Your job: read the draft, find violations of the rules below, and return a REVISED plan "
     "that fixes them. If a scene already obeys the rules, keep it unchanged.\n\n"
-    "Return STRICT JSON in the EXACT same shape as the input: "
-    "{character, scenes:[{starting_pose, ending_pose, description, motion, video_prompt}]}\n"
-    "No markdown, no commentary, no notes about what you changed — just the corrected JSON.\n\n"
+    "Return STRICT JSON in the EXACT same shape as the input. Preserve EVERY field on every scene "
+    "(location_id, starting_pose, ending_pose, prev_link, description, motion, motion_timeline, "
+    "camera, video_prompt, motion_intensity, characters_in_scene). Preserve the `characters` and "
+    "`locations` arrays at the top level. No markdown, no commentary, no notes about what you "
+    "changed — just the corrected JSON.\n\n"
     "Hard constraints:\n"
     "- Scene COUNT must stay identical to the draft. Do not add or remove scenes; rewrite in place.\n"
-    "- Keep the character's canonical description intact.\n\n"
+    "- Keep the character canon and the locations list intact (you may refine prose, but ids stay).\n\n"
     "Things to check and fix:\n"
-    "1. SETTING TELEPORTS: do consecutive scenes share the same physical setting? If scene N is in "
-    "   place A and scene N+1 is in place B with no transit, REWRITE one of them so they're in "
-    "   the same place. Place transit beats explicitly ('opens the door', 'climbs onto the ship').\n"
-    "2. PACKED SCENES: does any scene have multiple actions joined by AND / THEN? Simplify to a "
+    "1. LOCATION TELEPORTS: do consecutive scenes share the same `location_id`? If scene N has "
+    "   location A and scene N+1 has location B without an intermediate transit, REWRITE one of "
+    "   them so they share a location id, OR convert it into an explicit transit (doorway, edge, "
+    "   threshold). Update both `location_id` and the scene's description+prev_link to match.\n"
+    "2. PREV_LINK QUALITY: does each scene's `prev_link` reference the previous scene's ending "
+    "   state by name? If it's generic ('Continues the story.'), rewrite it to name the previous "
+    "   action or location concretely.\n"
+    "3. PACKED SCENES: does any scene have multiple actions joined by AND / THEN? Simplify to a "
     "   single primary action; move the dropped action to a neighboring scene if it fits.\n"
-    "3. POSE CHAIN: does scene[i].starting_pose match scene[i-1].ending_pose word-for-word? If not, "
-    "   align them.\n"
-    "4. STORY ARC: does the sequence have a clear beginning (setup), middle (rising action), and "
-    "   end (resolution)? If a scene is filler or out of order, rewrite it to advance the arc.\n"
-    "5. CHARACTER CONSISTENCY: is the character described or referenced the same way throughout?\n"
-    "6. ONE-MOTION RULE: each video_prompt should describe ONE simple motion completable in ~5s.\n\n"
+    "4. POSE CHAIN: does scene[i].starting_pose match scene[i-1].ending_pose word-for-word? If "
+    "   not, align them.\n"
+    "5. MOTION TIMELINE: does each scene have a `motion_timeline` with 2-3 timed verb beats "
+    "   ('0-2s: ...')? If missing or vague, decompose the scene's motion into timed beats.\n"
+    "6. CAMERA: is each scene's `camera` set to a valid value? If missing, set 'static'.\n"
+    "7. STORY ARC: does the sequence have a clear beginning, middle, and end? Rewrite filler.\n"
+    "8. ONE-MOTION RULE: each video_prompt describes ONE simple motion completable in ~5s.\n\n"
     "If the draft is already clean, return it essentially unchanged."
 )
 
@@ -212,8 +246,8 @@ async def improve_prompt(short: str, style: Optional[str] = None) -> str:
 
 
 def render_canon(canon: dict | None) -> str:
-    """Render the character canon dict as a single descriptive clause used verbatim in
-    every Flux prompt. Empty/missing parts are skipped so we don't leak placeholder text."""
+    """Render a single character canon dict as a descriptive clause used verbatim in
+    Flux prompts. Empty/missing parts are skipped so we don't leak placeholder text."""
     if not isinstance(canon, dict):
         return ""
     parts: list[str] = []
@@ -226,6 +260,123 @@ def render_canon(canon: dict | None) -> str:
     name = (canon.get("name") or "").strip()
     body = ", ".join(parts)
     return f"{name} ({body})" if name else body
+
+
+def render_cast(characters: list, names: list[str] | None = None) -> str:
+    """Render multiple character canons as a single combined clause. If `names` is
+    given, only render the characters whose `name` matches one in the list. Joined
+    with semicolons so Flux/Kontext parses each canon distinctly."""
+    if not isinstance(characters, list) or not characters:
+        return ""
+    if names is not None:
+        wanted = {n.strip().lower() for n in names if n}
+        characters = [c for c in characters if isinstance(c, dict)
+                      and (c.get("name") or "").strip().lower() in wanted]
+    clauses = [render_canon(c) for c in characters]
+    return "; ".join(c for c in clauses if c)
+
+
+def coerce_characters(plan: dict) -> list[dict]:
+    """Normalise the `characters` list from a plan dict. Accepts:
+      - new format: plan["characters"] = [{name, role, species, ...}, ...]
+      - old format: plan["character_canon"] = {name, species, ...} (single character)
+    Always returns a list with the protagonist first."""
+    chars = plan.get("characters")
+    if isinstance(chars, list) and chars:
+        out = []
+        for c in chars:
+            if isinstance(c, dict) and (c.get("name") or "").strip():
+                # Default role inference: protagonist if it's the first one and unspecified
+                role = (c.get("role") or "").strip().lower()
+                if role not in ("protagonist", "supporting"):
+                    role = "protagonist" if not out else "supporting"
+                out.append({**c, "role": role})
+        # Ensure exactly one protagonist (first one wins; others demoted)
+        seen_protagonist = False
+        for c in out:
+            if c["role"] == "protagonist":
+                if seen_protagonist:
+                    c["role"] = "supporting"
+                seen_protagonist = True
+        return out
+    # Fall back to the old single-canon shape
+    legacy = plan.get("character_canon")
+    if isinstance(legacy, dict) and (legacy.get("name") or "").strip():
+        return [{**legacy, "role": "protagonist"}]
+    return []
+
+
+def protagonist_of(characters: list[dict]) -> dict | None:
+    """Return the protagonist character (first one with role='protagonist') or None."""
+    for c in characters:
+        if isinstance(c, dict) and c.get("role") == "protagonist":
+            return c
+    return characters[0] if characters else None
+
+
+def _slugify_location_id(s: str) -> str:
+    s = (s or "").strip().lower()
+    out = []
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch)
+        elif ch in " -_":
+            out.append("-")
+    slug = "".join(out).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug or "place"
+
+
+def coerce_locations(plan: dict) -> list[dict]:
+    """Normalise the `locations` list. Ensures every entry has non-empty id/name/description
+    and ids are unique slugified strings. Returns at least one fallback entry if empty."""
+    raw = plan.get("locations")
+    out: list[dict] = []
+    seen_ids: set[str] = set()
+    if isinstance(raw, list):
+        for loc in raw:
+            if not isinstance(loc, dict):
+                continue
+            lid = _slugify_location_id(loc.get("id") or loc.get("name") or "")
+            if not lid or lid in seen_ids:
+                # de-dup by suffixing
+                base = lid or "place"
+                i = 2
+                while f"{base}-{i}" in seen_ids:
+                    i += 1
+                lid = f"{base}-{i}" if base else f"place-{i}"
+            seen_ids.add(lid)
+            out.append({
+                "id":          lid,
+                "name":        (loc.get("name") or lid.replace("-", " ")).strip(),
+                "description": (loc.get("description") or "").strip(),
+            })
+    if not out:
+        out.append({"id": "scene", "name": "the scene", "description": ""})
+    return out
+
+
+def location_by_id(locations: list[dict], lid: str) -> dict | None:
+    """Find a location dict by id; case-insensitive, slug-normalised."""
+    if not lid:
+        return None
+    target = _slugify_location_id(lid)
+    for loc in locations:
+        if isinstance(loc, dict) and _slugify_location_id(loc.get("id") or "") == target:
+            return loc
+    return None
+
+
+def render_location(loc: dict | None) -> str:
+    """Render a location as a descriptive clause for prompts. Empty parts skipped."""
+    if not isinstance(loc, dict):
+        return ""
+    name = (loc.get("name") or "").strip()
+    desc = (loc.get("description") or "").strip()
+    if name and desc:
+        return f"{name} — {desc}"
+    return name or desc
 
 
 async def plan_storybook(
@@ -257,14 +408,15 @@ async def plan_storybook(
 
     locked_clause = ""
     if existing_canon or existing_character:
-        canon_json = json.dumps(existing_canon or {}, ensure_ascii=False)
+        # Wrap the legacy single-canon shape into the new array form for the locked clause
+        protagonist_locked = {**(existing_canon or {}), "role": "protagonist"}
         prose = (existing_character or "").strip()
         locked_clause = (
-            "\n\nLOCKED CHARACTER: a saved character is being re-used. Do NOT invent a new "
-            "protagonist. Your `character_canon` and `character` fields MUST be set to these "
-            "exact values (copy them verbatim into the plan) and every scene must reference "
-            "this character.\n"
-            f"  character_canon = {canon_json}\n"
+            "\n\nLOCKED PROTAGONIST: a saved character is being re-used. The first entry of "
+            "`characters` (role='protagonist') MUST be set to the exact object below (copy it "
+            "verbatim) and `character` MUST be set to the exact prose below. You may still add "
+            "supporting characters appropriate to the story, but the protagonist is locked.\n"
+            f"  characters[0] = {json.dumps(protagonist_locked, ensure_ascii=False)}\n"
             f"  character (prose) = \"{prose}\"\n"
         )
 
@@ -272,21 +424,34 @@ async def plan_storybook(
         f"Story idea: {story.strip()}\n\n"
         f"Number of scenes: EXACTLY {n_pages} (no more, no fewer)\n"
         f"Illustration style: {style}\n\n"
-        f"Every scene MUST include: starting_pose, ending_pose, description, motion, "
-        f"video_prompt, motion_intensity. The character_canon object is REQUIRED and its "
-        f"name/species/colors/features fields are mandatory (clothing/accessories may be empty). "
-        f"The starting_pose of each scene (after scene 1) MUST match the previous scene's "
-        f"ending_pose exactly. Reference the character by name in every scene. Return STRICT JSON only."
+        f"Every scene MUST include: location_id, starting_pose, ending_pose, prev_link, "
+        f"description, motion, motion_timeline, camera, video_prompt, motion_intensity, "
+        f"characters_in_scene. The `locations` array is REQUIRED — enumerate every distinct "
+        f"setting (typically 2-5 entries) and tag each scene with one of those ids. The "
+        f"`characters` array is REQUIRED and contains the protagonist plus every supporting "
+        f"character that appears; each character needs non-empty name/species/colors/features "
+        f"(clothing/accessories may be empty). Each scene's `characters_in_scene` lists only "
+        f"characters physically present (always include the protagonist). The starting_pose of "
+        f"each scene (after scene 1) MUST match the previous scene's ending_pose exactly. The "
+        f"prev_link must explicitly reference the previous scene's ending state by name. "
+        f"Return STRICT JSON only."
         + outline_hint
         + locked_clause
     )
     plan = await _request_plan(user, n_pages, max_tokens=3072 + 256 * max(0, n_pages - 6))
 
-    # If a character is locked, force-overwrite whatever the LLM returned in case it drifted.
-    if existing_canon:
-        plan["character_canon"] = existing_canon
-    if existing_character:
-        plan["character"] = existing_character
+    # If a character is locked, force-overwrite the protagonist entry in case the model drifted.
+    if existing_canon or existing_character:
+        chars = coerce_characters(plan)
+        if not chars:
+            chars = [{"name": (existing_canon or {}).get("name") or "the character",
+                      "role": "protagonist"}]
+        if existing_canon:
+            # Replace protagonist's canon with the locked one (keep role='protagonist').
+            chars[0] = {**(existing_canon or {}), "role": "protagonist"}
+        plan["characters"] = chars
+        if existing_character:
+            plan["character"] = existing_character
 
     # Validate & repair empties / count mismatches
     needs_retry = False
@@ -333,14 +498,22 @@ async def plan_storybook(
         })
     # Fill any individual empty fields
     fallback = {
-        "starting_pose": "in a calm, settled stance",
-        "ending_pose": "in a calm, settled stance",
-        "description": "A quiet moment in the story.",
-        "motion": "subtle motion",
-        "video_prompt": "A soft warm storybook scene. Gentle, slow motion. Cinematic lighting that settles peacefully.",
+        "starting_pose":    "in a calm, settled stance",
+        "ending_pose":      "in a calm, settled stance",
+        "prev_link":        "Continues directly from the previous moment.",
+        "description":      "A quiet moment in the story.",
+        "motion":           "subtle motion",
+        "motion_timeline":  "0-2s: gentle breath and small adjustment. 2-5s: the small motion completes.",
+        "camera":           "static",
+        "video_prompt":     "A soft warm storybook scene. Gentle, slow motion. Cinematic lighting that settles peacefully.",
         "motion_intensity": "gentle",
     }
     valid_intensities = {"still", "gentle", "dynamic"}
+    valid_cameras = {
+        "static", "slow dolly in", "slow dolly out",
+        "slow pan left", "slow pan right",
+        "slow tilt up", "slow tilt down",
+    }
     for i, s in enumerate(plan["scenes"]):
         if not isinstance(s, dict):
             plan["scenes"][i] = dict(fallback)
@@ -351,18 +524,76 @@ async def plan_storybook(
         # Normalise motion_intensity onto the small allowed set
         mi = (s.get("motion_intensity") or "gentle").strip().lower()
         s["motion_intensity"] = mi if mi in valid_intensities else "gentle"
+        # Normalise camera onto the small allowed set
+        cam = (s.get("camera") or "static").strip().lower()
+        s["camera"] = cam if cam in valid_cameras else "static"
 
-    # Ensure character_canon at least exists (orchestrator falls back to plan["character"]).
-    canon = plan.get("character_canon")
-    if not isinstance(canon, dict):
-        plan["character_canon"] = {}
+    # Normalise the characters array (also handles old-format saved-character locks).
+    plan["characters"] = coerce_characters(plan)
+    if not plan["characters"]:
+        # Last-resort fallback: synthesise a generic protagonist so the orchestrator
+        # always has something to inject. This should be very rare.
+        plan["characters"] = [{
+            "name": "Hero",
+            "role": "protagonist",
+            "species": "the main character",
+            "colors": "",
+            "features": "",
+            "clothing": "",
+            "accessories": "",
+        }]
+
+    # Sync the prose `character` field with the protagonist for UI display.
+    proto = protagonist_of(plan["characters"])
+    if proto and not (plan.get("character") or "").strip():
+        plan["character"] = render_canon(proto)
+    # Keep `character_canon` populated as the protagonist's canon, for backward compat
+    # with the character library save endpoint that reads that single field.
+    if proto:
+        plan["character_canon"] = {k: v for k, v in proto.items() if k != "role"}
+
+    # Enforce characters_in_scene includes the protagonist + only references known names.
+    known_names = {(c.get("name") or "").strip() for c in plan["characters"]}
+    protagonist_name = (proto.get("name") or "").strip() if proto else ""
+    for s in plan["scenes"]:
+        in_scene = s.get("characters_in_scene")
+        if not isinstance(in_scene, list):
+            in_scene = []
+        # Keep only names that match known characters; preserve order.
+        in_scene = [n for n in in_scene if isinstance(n, str) and n.strip() in known_names]
+        # Always include the protagonist.
+        if protagonist_name and protagonist_name not in in_scene:
+            in_scene.insert(0, protagonist_name)
+        s["characters_in_scene"] = in_scene
+
+    # Normalise locations + assign each scene a valid location_id. If the planner emitted
+    # no locations, synthesise one from the protagonist's setting so downstream code always
+    # has something to render.
+    plan["locations"] = coerce_locations(plan)
+    known_loc_ids = {loc["id"] for loc in plan["locations"]}
+    default_loc_id = plan["locations"][0]["id"]
+    last_loc_id = default_loc_id
+    for s in plan["scenes"]:
+        lid_raw = (s.get("location_id") or "").strip()
+        lid = _slugify_location_id(lid_raw) if lid_raw else ""
+        if lid not in known_loc_ids:
+            # Fall back to the previous scene's location id (keeps continuity) rather than
+            # the first location — better than randomly snapping to setup-time location.
+            lid = last_loc_id
+        s["location_id"] = lid
+        last_loc_id = lid
 
     # Enforce pose-chain continuity: each scene's starting_pose := previous ending_pose.
-    # The LLM is asked to do this but we make it crisp here.
     for i in range(1, len(plan["scenes"])):
         prev_end = (plan["scenes"][i - 1].get("ending_pose") or "").strip()
         if prev_end:
             plan["scenes"][i]["starting_pose"] = prev_end
+
+    # Scene 1's prev_link is always "opening scene" — overwrite if the LLM didn't.
+    if plan["scenes"]:
+        first_link = (plan["scenes"][0].get("prev_link") or "").strip().lower()
+        if not first_link or "scene 1" in first_link or "previous" in first_link:
+            plan["scenes"][0]["prev_link"] = "Opening scene."
     return plan
 
 
@@ -424,17 +655,36 @@ async def _critique_plan(story: str, draft: dict, n_pages: int, style: str) -> d
     new_scenes = revised.get("scenes") or []
     if not isinstance(new_scenes, list) or len(new_scenes) != n_pages:
         return draft
-    # Drop revisions where any scene lost a required field
-    required = ("starting_pose", "ending_pose", "description", "motion", "video_prompt")
-    for s in new_scenes:
+    # If a critical field is missing on the revised scene, copy it from the draft
+    # rather than discarding the whole revision (the LLM often drops a couple of
+    # newer fields like motion_timeline even when the rest of the revision is solid).
+    merge_keys = (
+        "starting_pose", "ending_pose", "prev_link", "description", "motion",
+        "video_prompt", "motion_timeline", "camera", "motion_intensity",
+        "location_id", "characters_in_scene",
+    )
+    for idx, s in enumerate(new_scenes):
         if not isinstance(s, dict):
             return draft
-        if not all((s.get(k) or "").strip() for k in required if k != "starting_pose"):
-            # starting_pose for scene 0 is allowed to be empty pre-enforcement
+        draft_s = draft_scenes[idx] if idx < len(draft_scenes) else {}
+        for k in merge_keys:
+            v = s.get(k)
+            if (isinstance(v, str) and not v.strip()) or v is None:
+                fallback = draft_s.get(k) if isinstance(draft_s, dict) else None
+                if fallback is not None:
+                    s[k] = fallback
+    # Hard floor: the essentials must end up populated. If not, fall back to draft.
+    essentials = ("description", "motion", "video_prompt")
+    for s in new_scenes:
+        if not all((s.get(k) or "").strip() for k in essentials):
             return draft
-    # Preserve the original character description if the revision dropped it
+    # Preserve the original character description / locations if the revision dropped them.
     if not (revised.get("character") or "").strip():
         revised["character"] = draft.get("character", "")
+    if not isinstance(revised.get("locations"), list) or not revised.get("locations"):
+        revised["locations"] = draft.get("locations", [])
+    if not isinstance(revised.get("characters"), list) or not revised.get("characters"):
+        revised["characters"] = draft.get("characters", [])
     return revised
 
 
