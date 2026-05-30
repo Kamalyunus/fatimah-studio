@@ -13,13 +13,36 @@ on a dual-3090 home rig.
 | Diffusion runtime      | ComfyUI on 8188                                          | Kijai's WanVideoWrapper + MultiGPU                                           |
 | Video model            | Wan 2.2 14B I2V (MoE: high-noise + low-noise expert)     | SOTA quality at FP8 in 2024–2025, robust FLF2V via end-frame guidance        |
 | Image model            | Flux schnell + Flux Kontext                              | Schnell is fast; Kontext locks character + setting via reference image       |
-| LLM                    | Ollama: `qwen3.6:latest`                                 | Single model — prompt improvement *and* storybook planning. JSON-capable.    |
+| LLM                    | Ollama: `qwen3.6:latest` (Qwen3.5-MoE 36B, Q4_K_M)       | Single model — prompt improvement *and* storybook planning. JSON-capable.    |
 | Attention              | SageAttention                                            | Lossless ~30% Wan speedup on this hardware                                   |
 | CLIP-vision            | `openai/clip-vit-base-patch32` (CPU)                     | Cheap drift scoring against the protagonist's canonical reference            |
-| Stitching              | ffmpeg                                                   | Hard-cut concat of silent Wan clips                                          |
+| Stitching              | ffmpeg                                                   | Crossfade concat of silent Wan clips (chained on each clip's real last frame) |
 | Upscale                | 4x-UltraSharp                                            | Solid photographic upscaler with low artifacts                               |
 | Remote access          | NordVPN Meshnet                                          | Peer-to-peer, no public IP exposure                                          |
 | LAN discovery          | avahi-daemon (mDNS)                                      | `fatimahstudio.local` resolves on the local network                          |
+
+## Backend module layout
+
+The backend is a small package of single-responsibility modules with a clean
+dependency DAG (`config ← store/models ← workflows/comfy ← state ← storybook ← main`),
+so there are no circular imports:
+
+| Module          | Responsibility                                                          |
+|-----------------|-------------------------------------------------------------------------|
+| `config.py`     | ComfyUI endpoints, on-disk paths, model filenames, tunables             |
+| `store.py`      | Atomic JSON load/save                                                    |
+| `models.py`     | Pydantic request models                                                  |
+| `workflows/wan.py`  | Wan 2.2 I2V workflow builder                                         |
+| `workflows/flux.py` | Flux Kontext / Kontext-edit / Flux / SDXL / upscale builders        |
+| `comfy.py`      | ComfyUI submit-and-wait + ffmpeg media helpers (thumb, last-frame, probe, stitch) |
+| `state.py`      | `GenState`, the shared active-gen singleton, ComfyUI monitor + poll loops, history persistence |
+| `storybook.py`  | The `_run_storybook` orchestrator + keyframe/regen/restitch/drift helpers |
+| `llm/`          | Ollama package — `prompts`, `client`, `render`, `planning`               |
+| `main.py`       | FastAPI app, lifespan, and all ~25 routes (thin route layer)            |
+
+The one piece of shared mutable state — the in-flight `GenState`, the asyncio lock,
+and the last error — lives in `state.py` and is accessed *qualified* (`state.active_gen`)
+from every module so reassignment is visible everywhere.
 
 ## Request/response shape
 
@@ -134,8 +157,9 @@ For each scene, in order:
 1. **START frame.**
    - Page 1: plain Flux T2I from `description + starting_pose`. The result is
      copied as the protagonist's canonical reference for every later Kontext call.
-   - Pages 2+: byte-perfect copy of the previous page's end image. This is what
-     makes the inter-scene cut invisible at stitch time.
+   - Pages 2+: byte-perfect copy of the previous page's end image. (This seeds the
+     keyframe preview; the *actual* Wan start image is later swapped for the previous
+     clip's real last rendered frame — see Phase B chaining.)
 
 2. **Composite Kontext reference.** Kontext only takes one image, so we build a
    left-to-right strip `[ bg_anchor | char1 | char2 | ... ]` where:
@@ -145,10 +169,20 @@ For each scene, in order:
      drift; after that we re-anchor.
    - The character panels lock each visible character's appearance.
 
-3. **END frame.** Flux Kontext on that composite, prompted with the pose change
-   first ("Bolt is now reaching for the door…"), then setting-lock language that
-   differs based on the anchor kind, then `prev_link`, then the object clause
-   ("at the end of the scene the protagonist is holding the recipe book").
+3. **END frame (hybrid).** A pose-delta classifier (`_poses_differ`, plus
+   `motion_intensity == dynamic`, an object change, or a location cut) decides
+   whether this scene even *needs* an end keyframe:
+   - **Ambient beat** (start ≈ end pose): **no end frame** — the scene animates as
+     pure image-to-video and Wan holds the start frame's background.
+   - **Real beat, same location:** the end frame is an **img2img Kontext edit of the
+     start frame** (`build_flux_kontext_edit_workflow`, denoise `0.6`) — it samples
+     from the start frame's own latent rather than empty noise, so the background is
+     preserved and only the pose changes. This is the fix for "the room reshuffles
+     every page."
+   - **Location cut:** a from-scratch Kontext render of the new room.
+
+   In every case the prompt leads with the pose change, then setting-lock language,
+   then `prev_link`, then the object clause.
 
 4. **Cache.** Every scene's prompt, seed, composite ref name, keyframe filenames,
    motion timeline, camera, objects, and assembled Wan prompt are stashed on the
@@ -174,45 +208,72 @@ user can:
 
 ### Phase B — Wan animation
 
-Per scene, Wan 2.2 14B I2V in FLF2V mode:
+Scenes are animated **sequentially** so each can chain on the previous one. Per scene,
+Wan 2.2 14B I2V:
 
-- `image` = the page's start frame
-- `end_image` = the page's end frame
-- 81 frames @ 16 fps ≈ 5 s (Wan 2.2's trained sweet spot)
+- `image` = the previous clip's **actual last rendered frame** (extracted with
+  `ffmpeg -sseof -1`), not the Kontext keyframe. Wan's FLF2V undershoots its end
+  target, so chaining on the *rendered* frame is what makes the seam invisible by
+  construction. (Page 1, and the page right after a location cut, start from their
+  own keyframe.)
+- `end_image` = the page's end frame for **FLF2V** beats; **empty** for ambient
+  beats, which run as pure I2V and hold the background.
+- **Camera is forced static** (`Camera: locked, no movement`). Independent per-clip
+  dolly/pan moves end at one framing and the next clip starts a different move from a
+  different framing — a major source of seam pops — so they're stripped (the LLM's
+  intended camera is still recorded as `planned_camera`).
+- 81 frames @ 16 fps ≈ 5 s (Wan 2.2's trained sweet spot); smoke mode uses 33.
 - `noise_aug` is selected from `motion_intensity` (still 0.0, gentle 0.05, dynamic 0.10)
 - Wan prompt is the assembled string: video_prompt + pose chain + setting +
-  timeline + camera + objects-held clause + "background remains stable" tail.
+  timeline + locked-camera + objects-held clause + "background remains stable" tail.
 
 Quality flags on by default: `use_slg`, `use_feta`, `use_teacache`. SageAttention.
 Block swap to cuda:1.
 
 ### Phase C — Stitch
 
-`ffmpeg concat` of the silent Wan clips. Because each clip's start is a byte-perfect
-copy of the previous clip's end, the cuts are invisible. Output:
-`wan_studio_storybook_<gen_id>.mp4`.
+`ffmpeg xfade` of the silent Wan clips with a short ~0.18 s crossfade per seam
+(`XFADE_DUR`). Because each clip already starts on the previous clip's real last
+frame, the boundary frames match; the crossfade just absorbs the residual
+motion-velocity discontinuity so the action eases across the cut instead of
+stop-starting. Output: `wan_studio_storybook_<gen_id>.mp4`.
 
-The history entry persists: the full plan, `scenes_meta` (every keyframe context),
-`locations_meta`, the protagonist's reference filename. This is enough to drive the
-per-scene Wan-regen flow without re-running anything else.
+The history entry persists: the full plan, `scenes_meta` (every keyframe context,
+including `use_flf2v` and the chained start frame), `locations_meta`, the
+protagonist's reference filename. This is enough to drive the per-scene Wan-regen
+flow without re-running anything else.
 
-## Background continuity (the prev-end-as-Kontext-ref trick)
+### Smoke-test mode
 
-The default failure mode of generating each Kontext scene from scratch is that the
-background reshuffles every page — the kitchen Bolt was just in becomes a *different*
-kitchen on the next page. To prevent this:
+`StorybookParams.smoke = true` runs the *real* pipeline end to end but fast: capped
+to `SMOKE_PAGES` (3), Wan at 8 steps / 33 frames, Kontext at 10 steps, and the
+keyframe approval gate auto-approved so it completes unattended in a few minutes
+instead of hours. The backend logs each page's keyframe route, and `smoke_test.py`
+posts the job, watches `/api/state`, and extracts the frames either side of every
+seam into `output/smoke_seams_<id>/`. Purpose: validate the background-lock, the
+frame chaining, and the crossfade before committing to a full-length run.
 
-- When scene N's `location_id` equals scene N-1's `location_id`, the leftmost
-  composite panel for scene N is **scene N-1's end image** rather than the canonical
-  location ref. Kontext sees the actual room from the previous scene and inherits
-  its layout, lighting, and props.
-- Setting-lock prompt language switches: "this scene takes place in the EXACT same
-  room shown in the leftmost panel — preserve the wall colors, shelves, windows,
-  furniture, and prop placement; only the protagonist's pose changes."
-- Chain length is capped at 3. After 3 consecutive inherited backgrounds, the next
-  same-location scene re-anchors to the canonical location ref. This bounds the
-  compounding drift that comes from each Kontext pass perturbing the reference
-  slightly.
+## Background continuity
+
+The default failure mode of generating each Kontext scene from empty noise is that
+the background reshuffles every page — the kitchen Bolt was just in becomes a
+*different* kitchen on the next page (a fridge appears, jars rearrange). Three
+mechanisms, in order of impact, keep the room stable:
+
+- **img2img end keyframes (the load-bearing fix).** For a same-location beat, the end
+  frame is generated by `build_flux_kontext_edit_workflow`, which seeds the sampler
+  from the start frame's *own* latent at denoise `0.6` instead of empty noise. The
+  existing composition — crucially the background — survives; only the character's
+  pose moves. The old path sampled from `EmptySD3LatentImage` at denoise `1.0` and
+  re-invented the whole room every call.
+- **Prev-end as the background anchor.** The leftmost panel of the Kontext composite
+  is scene N-1's end image when the location is unchanged, with hard "preserve the
+  EXACT room" prompt language. Re-anchoring to the canonical location ref now happens
+  **only on a genuine location change** (the old 3-scene chain cap that forced a
+  periodic re-render — and a periodic background pop — is removed).
+- **Frame chaining into Wan.** Even with matched keyframes, the *rendered* clips are
+  what the viewer sees, so each clip starts from the previous clip's real last frame
+  (Phase B) and Wan I2V holds that background forward.
 
 ## Object continuity
 
@@ -241,9 +302,9 @@ The chain that produced kid-readable continuity, in order of impact:
 2. **Composite Kontext ref with all visible characters.** Side-by-side strip of
    per-character refs (one panel per character) so multi-character scenes carry
    every face into Kontext.
-3. **Byte-perfect FLF2V chaining.** Page N's start frame is a verbatim copy of page
-   N-1's end frame. Wan's first frame is identical to the previous page's last
-   frame, with no re-illustration gap.
+3. **Last-frame chaining.** Each Wan clip starts from the previous clip's *actual
+   last rendered frame*, so there is no re-illustration gap and the character carries
+   forward exactly across the seam.
 4. **CLIP drift scoring.** Cheap CPU check that flags scenes where the character
    drifted from the canonical look; the UI exposes a regen button for those scenes.
 5. **Saved-character library.** A finished storybook's protagonist can be saved to
@@ -258,14 +319,27 @@ The chain that produced kid-readable continuity, in order of impact:
 | `use_teacache` | `WanVideoTeaCache`       | Caches denoising deltas, ~1.5–2× speedup, minor cost    |
 | `sageattn`     | `attention_mode`         | SageAttention — lossless ~30% speedup                   |
 
-All wired into both the high-noise and low-noise samplers. Frame count is fixed at
-81 (Wan 2.2's trained sweet spot for ~5 s).
+All wired into both the high-noise and low-noise samplers. Frame count is 81 for a
+full run (Wan 2.2's trained sweet spot for ~5 s); smoke mode drops to 33 frames /
+8 steps. `KONTEXT_EDIT_DENOISE` (0.6) and `XFADE_DUR` (0.18 s) are the two visual
+tunables for the background-lock strength and the seam crossfade.
 
 ## LLM behavior
 
-A single Ollama model (`qwen3.6:latest`) handles both prompt improvement and
-storybook planning. It's heavier than a small JSON model but writes noticeably
-better prompts and plans; the unload protocol keeps it out of VRAM during diffusion.
+A single Ollama model (`qwen3.6:latest` — a Qwen3.5-MoE 36B, Q4_K_M) handles both
+prompt improvement and storybook planning. It's heavier than a small JSON model but
+writes noticeably better prompts and plans; the unload protocol keeps it out of VRAM
+during diffusion.
+
+- **Context length** is *not* set by the backend, so Ollama loads the model at its
+  default — the full **262 144 (256 K)** native window. Input never truncates;
+  planning prompts are a few KB. (Ollama doesn't pre-allocate the KV cache, so the
+  big default costs no extra VRAM in practice.)
+- **Output cap** (`num_predict`) is set per call and scales with page count, sized so
+  the plan/retry/critique passes — each of which re-emits the *whole* plan — don't
+  truncate. Plan and retry use `~3072–4096 + 256·(pages−6)`; the critique uses the
+  same headroom (it returns a full revised plan). A truncated/invalid critique falls
+  back to the un-critiqued draft rather than failing.
 
 Server-side post-processing on every plan:
 - `coerce_characters` / `coerce_locations` normalise both arrays and assign

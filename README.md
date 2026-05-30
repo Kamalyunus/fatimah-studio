@@ -23,13 +23,21 @@ silent MP4 you can watch on the couch.
   1280×768.
 - **Photo enhancer** — 4× upscale with 4x-UltraSharp.
 - **Character consistency** — Flux Kontext locks the protagonist's appearance
-  across all scenes; supporting characters get model-sheet refs; byte-perfect
-  end-frame → next-page start-frame chaining keeps pose continuity. CLIP-vision
-  drift detection flags scenes where the character has drifted.
+  across all scenes; supporting characters get model-sheet refs; each clip starts
+  from the *actual last rendered frame* of the previous clip so pose continuity is
+  exact. CLIP-vision drift detection flags scenes where the character has drifted.
 - **Background continuity** — locations are first-class entities. Same-location
-  scenes inherit the previous scene's end image as the Kontext background anchor
-  (capped at 3-scene chains to bound drift) so the kitchen Bolt is in stays the
-  same kitchen.
+  beats regenerate the end keyframe as an **img2img Kontext edit of the start
+  frame** (preserve the room, change only the pose), and re-anchor only on a real
+  location change — so the kitchen Bolt is in stays the *same* kitchen instead of
+  reshuffling every page.
+- **Seamless cuts** — pages chain on the previous clip's real last frame and stitch
+  with a short crossfade, so the page-to-page seams read as one continuous shot
+  instead of popping. The camera is locked per clip (no per-shot dolly/pan that
+  would jump at every cut).
+- **Hybrid keyframes** — a pose-delta classifier routes each scene: ambient beats
+  animate as pure image-to-video (background held by Wan), real pose beats get a
+  background-locked Kontext keyframe, and genuine location changes render fresh.
 - **Object continuity** — every scene declares what the protagonist is holding;
   the LLM critique pass refuses plans where props appear from thin air.
 - **Character library** — save a protagonist from a finished storybook and re-use
@@ -37,6 +45,9 @@ silent MP4 you can watch on the couch.
 - **Per-scene regenerate** — re-roll a single keyframe at the approval gate, or
   re-animate a single Wan scene after the storybook is done, without redoing
   the rest.
+- **Fast smoke-test mode** — a `smoke` flag runs a short, low-step, auto-approved
+  3-page generation in a few minutes, so the coherency pipeline can be eyeballed
+  before committing to a full-length, full-quality run.
 - **Quality stack on by default** — Wan 2.2 14B MoE (two-expert chain) with Skip
   Layer Guidance, Enhance-A-Video, TeaCache, and SageAttention.
 - **Dual-GPU aware** — block-swap to a second GPU keeps each 24 GB card from
@@ -59,10 +70,11 @@ silent MP4 you can watch on the couch.
                                         │ /api/*
                                         ▼
                   ┌────────────────────────────────────────────────────┐
-                  │ FastAPI backend (8000) — main.py                   │
-                  │   • Builds ComfyUI workflow JSON                   │
-                  │   • Orchestrates storybook pipeline                │
-                  │   • Calls Ollama, ffmpeg                           │
+                  │ FastAPI backend (8000) — main.py + modules         │
+                  │   • workflows/  builds ComfyUI workflow JSON       │
+                  │   • storybook   orchestrates the pipeline          │
+                  │   • comfy/state submit + track the active gen      │
+                  │   • llm/        Ollama planner & prompt-improve     │
                   └─────┬─────────────────┬──────────────────────────┬─┘
                         │                 │                          │
                         ▼                 ▼                          ▼
@@ -95,9 +107,17 @@ smaller block swap count). It will not work comfortably below 16 GB.
 ```
 studio/
 ├── backend/
-│   ├── main.py          FastAPI app, ComfyUI workflow builders, storybook orchestrator
-│   ├── llm.py           Ollama wrapper (prompt-improve + storybook planner)
+│   ├── main.py          FastAPI app + all HTTP/WS routes (thin route layer)
+│   ├── config.py        Endpoints, paths, model filenames, tunables
+│   ├── models.py        Pydantic request models
+│   ├── store.py         Atomic JSON load/save
+│   ├── comfy.py         ComfyUI submit + ffmpeg media helpers (thumb, stitch, …)
+│   ├── state.py         GenState + active-gen singleton + ComfyUI monitor loops
+│   ├── storybook.py     Storybook orchestrator (plan → keyframes → Wan → stitch)
+│   ├── workflows/       Workflow builders — wan.py (Wan I2V), flux.py (Flux/SDXL)
+│   ├── llm/             Ollama package — prompts, client, render, planning
 │   ├── drift.py         CLIP-vision drift scoring (CPU)
+│   ├── smoke_test.py    Fast end-to-end smoke runner (smoke-mode storybook)
 │   ├── characters.json  Saved-character library (auto-created)
 │   ├── character_refs/  PNG refs for the saved-character library (auto-created)
 │   ├── history.json     Local history of generations (auto-created)
@@ -154,6 +174,21 @@ Open `http://fatimahstudio.local:3000/` on the LAN, or `http://localhost:3000/`.
 
 (On my box, the backend is a `fatimah-backend.service` user unit that depends on
 the `More Data` drive being mounted via fstab so the model weights are reachable.)
+
+### Smoke test
+
+With the backend, ComfyUI, and Ollama all up, a fast end-to-end check (3 short pages,
+low steps, auto-approved — a few minutes instead of hours) validates the coherency
+pipeline and drops seam frames for inspection:
+
+```bash
+cd studio/backend
+/home/yunus/Documents/comfyui/venv/bin/python smoke_test.py
+```
+
+It posts a `smoke: true` storybook, watches progress, then writes the seam frames to
+`output/smoke_seams_<id>/`. The backend log prints each page's keyframe route
+(`pure-I2V` / `img2img background-locked` / `from-scratch location cut`).
 
 ## Remote access (optional)
 
