@@ -16,6 +16,8 @@ dist/
 # Generated state — local to each install
 backend/history.json
 backend/presets.json
+backend/characters.json
+backend/character_refs/
 backend/thumbs/
 backend/__pycache__/
 

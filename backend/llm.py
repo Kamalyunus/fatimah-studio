@@ -92,7 +92,9 @@ _STORY_SYSTEM = (
     "      \"camera\":        \"<one of: 'static', 'slow dolly in', 'slow dolly out', 'slow pan left', 'slow pan right', 'slow tilt up', 'slow tilt down'. Pick the one that supports the moment; default to 'static' if unsure.>\",\n"
     "      \"video_prompt\":  \"<CONCISE cinematic direction for ONE simple motion (25-45 words). Name: (1) shot framing (close-up / medium / wide / overhead), (2) one short motion arc from starting_pose to ending_pose with manner (slowly, gently, eagerly), (3) one ambient detail (leaves drifting, steam rising). Avoid stacking multiple actions.>\",\n"
     "      \"motion_intensity\": \"<one of: 'still' (sitting, blinking, breathing), 'gentle' (waving, turning head, reaching), 'dynamic' (jumping, running steps, throwing). Default to 'gentle' if unsure.>\",\n"
-    "      \"characters_in_scene\": [\"<exact character name>\", ...]  // ALWAYS include the protagonist. Include supporting characters ONLY when physically visible.\n"
+    "      \"characters_in_scene\": [\"<exact character name>\", ...],  // ALWAYS include the protagonist. Include supporting characters ONLY when physically visible.\n"
+    "      \"objects_in_hand\":     [\"<short name>\", ...],  // objects the protagonist is HOLDING at the END of this scene. Empty list if hands are empty. Examples: 'recipe book', 'flour bag', 'measuring cup'.\n"
+    "      \"object_change\":       \"<one of: 'none' | 'picks up X' | 'puts down X' | 'swaps X for Y'. Describes how objects_in_hand changed from the previous scene. Must match what the scene visibly shows.>\"\n"
     "    }\n"
     "  ]\n"
     "}\n\n"
@@ -104,11 +106,15 @@ _STORY_SYSTEM = (
     "   - BAD: scene 3 location_id='kitchen', scene 4 location_id='meadow'. Background teleport.\n"
     "   - GOOD: scene 3 ends 'opening the kitchen door, looking out'. Scene 4 location_id='kitchen-doorway' shows stepping through. Scene 5 location_id='meadow'.\n"
     "4. NARRATIVE CONTINUITY (`prev_link`): every scene's prev_link must explicitly name the previous scene's ending state or location, so the new image obviously continues from the last one — not a hard cut.\n"
-    "5. CHARACTER ROSTER: include every recurring character in `characters`; each scene's `characters_in_scene` lists ONLY characters PHYSICALLY VISIBLE. Many scenes will be protagonist-only.\n"
-    "6. The image (`description`) AND the video (`video_prompt`) must both reflect the protagonist's starting_pose, so the first frame of the animation matches the previous page's last frame.\n"
-    "7. ONE primary action per scene. Use the `motion_timeline` to break the 5s into 2-3 small verb beats — that is your single action, decomposed in time, NOT three separate actions. Resist packing multiple distinct actions.\n"
-    "8. The pose change from starting_pose to ending_pose should be small enough to render in ~5 seconds (a tilt of the head, a hand reaching, two steps). Avoid full-body locomotion arcs.\n"
-    "9. Child-friendly. Slow camera only."
+    "5. OBJECT CONTINUITY (HARD RULE): scene[i].objects_in_hand must equal scene[i-1].objects_in_hand UNLESS scene[i] visibly shows a pickup/putdown/swap (description + motion + video_prompt must all describe it, and `object_change` must say so).\n"
+    "   - You CANNOT have the protagonist holding flour in scene 5 if they were holding a recipe book in scene 4 with no putdown-or-swap scene in between.\n"
+    "   - Props that have not been picked up cannot appear in `description`. If scene N's description shows a tray of cookies, scene N-1's `objects_in_hand` must already include 'tray of cookies', OR scene N must be the pickup beat.\n"
+    "   - When a new object appears, allocate a SCENE for fetching/preparing it. Don't bury it in a transit beat.\n"
+    "6. CHARACTER ROSTER: include every recurring character in `characters`; each scene's `characters_in_scene` lists ONLY characters PHYSICALLY VISIBLE. Many scenes will be protagonist-only.\n"
+    "7. The image (`description`) AND the video (`video_prompt`) must both reflect the protagonist's starting_pose, so the first frame of the animation matches the previous page's last frame.\n"
+    "8. ONE primary action per scene. Use the `motion_timeline` to break the 5s into 2-3 small verb beats — that is your single action, decomposed in time, NOT three separate actions. Resist packing multiple distinct actions.\n"
+    "9. The pose change from starting_pose to ending_pose should be small enough to render in ~5 seconds (a tilt of the head, a hand reaching, two steps). Avoid full-body locomotion arcs.\n"
+    "10. Child-friendly. Slow camera only."
 )
 
 _OUTLINE_SYSTEM = (
@@ -162,18 +168,26 @@ _CRITIQUE_SYSTEM = (
     "   location A and scene N+1 has location B without an intermediate transit, REWRITE one of "
     "   them so they share a location id, OR convert it into an explicit transit (doorway, edge, "
     "   threshold). Update both `location_id` and the scene's description+prev_link to match.\n"
-    "2. PREV_LINK QUALITY: does each scene's `prev_link` reference the previous scene's ending "
+    "2. OBJECT CONTINUITY (HARD): for every scene, compare `objects_in_hand` to the previous "
+    "   scene's `objects_in_hand`. If they differ, the scene MUST visibly show a pickup, "
+    "   putdown, or swap (description + motion + video_prompt all name the object handling, and "
+    "   `object_change` says what happened). If the description mentions a prop (tray, book, "
+    "   tool) that the protagonist is not holding in the previous scene AND there's no explicit "
+    "   fetch beat, REWRITE: either drop the prop, change description to match what's actually "
+    "   in hand, OR convert this scene into the pickup beat. A 'tray of cookies' cannot appear "
+    "   if no scene shows them being made.\n"
+    "3. PREV_LINK QUALITY: does each scene's `prev_link` reference the previous scene's ending "
     "   state by name? If it's generic ('Continues the story.'), rewrite it to name the previous "
     "   action or location concretely.\n"
-    "3. PACKED SCENES: does any scene have multiple actions joined by AND / THEN? Simplify to a "
+    "4. PACKED SCENES: does any scene have multiple actions joined by AND / THEN? Simplify to a "
     "   single primary action; move the dropped action to a neighboring scene if it fits.\n"
-    "4. POSE CHAIN: does scene[i].starting_pose match scene[i-1].ending_pose word-for-word? If "
+    "5. POSE CHAIN: does scene[i].starting_pose match scene[i-1].ending_pose word-for-word? If "
     "   not, align them.\n"
-    "5. MOTION TIMELINE: does each scene have a `motion_timeline` with 2-3 timed verb beats "
+    "6. MOTION TIMELINE: does each scene have a `motion_timeline` with 2-3 timed verb beats "
     "   ('0-2s: ...')? If missing or vague, decompose the scene's motion into timed beats.\n"
-    "6. CAMERA: is each scene's `camera` set to a valid value? If missing, set 'static'.\n"
-    "7. STORY ARC: does the sequence have a clear beginning, middle, and end? Rewrite filler.\n"
-    "8. ONE-MOTION RULE: each video_prompt describes ONE simple motion completable in ~5s.\n\n"
+    "7. CAMERA: is each scene's `camera` set to a valid value? If missing, set 'static'.\n"
+    "8. STORY ARC: does the sequence have a clear beginning, middle, and end? Rewrite filler.\n"
+    "9. ONE-MOTION RULE: each video_prompt describes ONE simple motion completable in ~5s.\n\n"
     "If the draft is already clean, return it essentially unchanged."
 )
 
@@ -277,33 +291,27 @@ def render_cast(characters: list, names: list[str] | None = None) -> str:
 
 
 def coerce_characters(plan: dict) -> list[dict]:
-    """Normalise the `characters` list from a plan dict. Accepts:
-      - new format: plan["characters"] = [{name, role, species, ...}, ...]
-      - old format: plan["character_canon"] = {name, species, ...} (single character)
-    Always returns a list with the protagonist first."""
+    """Normalise the `characters` list from a plan dict. Returns a list with the
+    protagonist first; every entry has a role of 'protagonist' or 'supporting'.
+    Empty list if the plan has no characters."""
     chars = plan.get("characters")
-    if isinstance(chars, list) and chars:
-        out = []
-        for c in chars:
-            if isinstance(c, dict) and (c.get("name") or "").strip():
-                # Default role inference: protagonist if it's the first one and unspecified
-                role = (c.get("role") or "").strip().lower()
-                if role not in ("protagonist", "supporting"):
-                    role = "protagonist" if not out else "supporting"
-                out.append({**c, "role": role})
-        # Ensure exactly one protagonist (first one wins; others demoted)
-        seen_protagonist = False
-        for c in out:
-            if c["role"] == "protagonist":
-                if seen_protagonist:
-                    c["role"] = "supporting"
-                seen_protagonist = True
-        return out
-    # Fall back to the old single-canon shape
-    legacy = plan.get("character_canon")
-    if isinstance(legacy, dict) and (legacy.get("name") or "").strip():
-        return [{**legacy, "role": "protagonist"}]
-    return []
+    if not isinstance(chars, list) or not chars:
+        return []
+    out: list[dict] = []
+    for c in chars:
+        if isinstance(c, dict) and (c.get("name") or "").strip():
+            role = (c.get("role") or "").strip().lower()
+            if role not in ("protagonist", "supporting"):
+                role = "protagonist" if not out else "supporting"
+            out.append({**c, "role": role})
+    # Exactly one protagonist (first one wins; others demoted).
+    seen_protagonist = False
+    for c in out:
+        if c["role"] == "protagonist":
+            if seen_protagonist:
+                c["role"] = "supporting"
+            seen_protagonist = True
+    return out
 
 
 def protagonist_of(characters: list[dict]) -> dict | None:
@@ -368,6 +376,21 @@ def location_by_id(locations: list[dict], lid: str) -> dict | None:
     return None
 
 
+def render_objects(objs: list | None) -> str:
+    """Render a list of object names as a short clause for the Flux/Wan prompts.
+    Empty list → empty string (callers can branch on that)."""
+    if not isinstance(objs, list) or not objs:
+        return ""
+    cleaned = [str(o).strip() for o in objs if str(o or "").strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
+
+
 def render_location(loc: dict | None) -> str:
     """Render a location as a descriptive clause for prompts. Empty parts skipped."""
     if not isinstance(loc, dict):
@@ -386,7 +409,7 @@ async def plan_storybook(
     existing_canon: Optional[dict] = None,
     existing_character: Optional[str] = None,
 ) -> dict:
-    """Return {character, character_canon, scenes:[{...}]} of length n_pages.
+    """Return {character, characters:[...], locations:[...], scenes:[{...}]} of length n_pages.
 
     Two-pass planning:
       1. Outline beat structure (setup → climax → resolution + scene counts per beat).
@@ -426,7 +449,7 @@ async def plan_storybook(
         f"Illustration style: {style}\n\n"
         f"Every scene MUST include: location_id, starting_pose, ending_pose, prev_link, "
         f"description, motion, motion_timeline, camera, video_prompt, motion_intensity, "
-        f"characters_in_scene. The `locations` array is REQUIRED — enumerate every distinct "
+        f"characters_in_scene, objects_in_hand, object_change. The `locations` array is REQUIRED — enumerate every distinct "
         f"setting (typically 2-5 entries) and tag each scene with one of those ids. The "
         f"`characters` array is REQUIRED and contains the protagonist plus every supporting "
         f"character that appears; each character needs non-empty name/species/colors/features "
@@ -507,6 +530,7 @@ async def plan_storybook(
         "camera":           "static",
         "video_prompt":     "A soft warm storybook scene. Gentle, slow motion. Cinematic lighting that settles peacefully.",
         "motion_intensity": "gentle",
+        "object_change":    "none",
     }
     valid_intensities = {"still", "gentle", "dynamic"}
     valid_cameras = {
@@ -547,10 +571,6 @@ async def plan_storybook(
     proto = protagonist_of(plan["characters"])
     if proto and not (plan.get("character") or "").strip():
         plan["character"] = render_canon(proto)
-    # Keep `character_canon` populated as the protagonist's canon, for backward compat
-    # with the character library save endpoint that reads that single field.
-    if proto:
-        plan["character_canon"] = {k: v for k, v in proto.items() if k != "role"}
 
     # Enforce characters_in_scene includes the protagonist + only references known names.
     known_names = {(c.get("name") or "").strip() for c in plan["characters"]}
@@ -565,6 +585,36 @@ async def plan_storybook(
         if protagonist_name and protagonist_name not in in_scene:
             in_scene.insert(0, protagonist_name)
         s["characters_in_scene"] = in_scene
+
+    # Normalise per-scene object lists: objects_in_hand is the SET of things the protagonist
+    # is holding at the END of the scene; object_change is the diff verb. We do not hard-reject
+    # the plan when the diff is inconsistent (qwen3.6 plans are noisy), but we do enforce a
+    # cheap consistency repair: if objects_in_hand changed but object_change is "none", flip
+    # it to a generic pickup/putdown so downstream prompts at least mention the handling.
+    prev_objects: list[str] = []
+    for s in plan["scenes"]:
+        raw = s.get("objects_in_hand")
+        if isinstance(raw, list):
+            objs = [str(o).strip() for o in raw if isinstance(o, (str, int, float)) and str(o).strip()]
+        elif isinstance(raw, str) and raw.strip():
+            objs = [raw.strip()]
+        else:
+            objs = []
+        s["objects_in_hand"] = objs
+        change = (s.get("object_change") or "").strip().lower()
+        prev_set, curr_set = set(prev_objects), set(objs)
+        if prev_set != curr_set and change in ("", "none"):
+            added = curr_set - prev_set
+            dropped = prev_set - curr_set
+            if added and dropped:
+                s["object_change"] = f"swaps {', '.join(sorted(dropped))} for {', '.join(sorted(added))}"
+            elif added:
+                s["object_change"] = f"picks up {', '.join(sorted(added))}"
+            elif dropped:
+                s["object_change"] = f"puts down {', '.join(sorted(dropped))}"
+        elif not change:
+            s["object_change"] = "none"
+        prev_objects = objs
 
     # Normalise locations + assign each scene a valid location_id. If the planner emitted
     # no locations, synthesise one from the protagonist's setting so downstream code always
@@ -661,7 +711,7 @@ async def _critique_plan(story: str, draft: dict, n_pages: int, style: str) -> d
     merge_keys = (
         "starting_pose", "ending_pose", "prev_link", "description", "motion",
         "video_prompt", "motion_timeline", "camera", "motion_intensity",
-        "location_id", "characters_in_scene",
+        "location_id", "characters_in_scene", "objects_in_hand", "object_change",
     )
     for idx, s in enumerate(new_scenes):
         if not isinstance(s, dict):
