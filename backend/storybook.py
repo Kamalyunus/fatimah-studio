@@ -528,22 +528,15 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 and (COMFY_INPUT / composite_ref_name).exists()
             )
 
-            # ---- Hybrid keyframe gate: FLF2V vs pure background-locked I2V ----
-            # Generate an explicit Kontext END keyframe (FLF2V target) ONLY when the scene
-            # has a real beat: a dynamic motion, a genuine pose change, or a location cut
-            # that establishes a new room. Ambient scenes (near-identical start/end pose)
-            # skip the end keyframe and animate as pure I2V from the carried-forward start
-            # frame — Wan I2V holds the input background, so the room stays pixel-stable
-            # rather than morphing toward a freshly re-rendered Kontext room. Character stays
-            # locked either way via the start frame + canon.
+            # ---- Keyframe routing: img2img background-lock vs from-scratch ----
+            # EVERY page renders its own end keyframe so each page advances visually — a
+            # storybook page is always a distinct beat even when its internal motion is
+            # small. (An earlier "pure-I2V for ambient pages" optimization skipped the
+            # render and reused the previous image, which froze runs of low-motion pages
+            # onto a single frame — never do that.) The only choice is *how* to render it:
+            #   - same location → img2img edit of the start frame (background preserved)
+            #   - location cut  → from-scratch render of the new room
             is_location_cut = i > 0 and bg_anchor_kind == "loc_ref"
-            has_prop_change = bool(object_change) and object_change.lower() != "none"
-            use_flf2v = (
-                intensity == "dynamic"
-                or has_prop_change
-                or is_location_cut
-                or _poses_differ(starting_pose, ending_pose)
-            )
 
             # ---- END image (Wan FLF2V target) ----
             # Kontext with the composite reference. Lead with the pose change so Kontext
@@ -607,55 +600,33 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                     f"pose, body position, and gesture are clearly different from the reference."
                 )
             end_seed = seed + i * 100 + 7
-            # Report which keyframe path this page took (handy in smoke runs to confirm the
-            # img2img background-lock actually got exercised).
-            if not use_flf2v:
-                _route = "pure-I2V (ambient, no end keyframe)"
-            elif use_kontext and not is_location_cut and (COMFY_INPUT / start_image_input_name).exists():
-                _route = "FLF2V img2img (background-locked)"
-            elif use_kontext:
-                _route = "FLF2V from-scratch (location cut)"
+            # From-scratch Kontext for every end keyframe. The composite reference already
+            # carries the background anchor (the location ref, or the previous scene's end
+            # frame for same-location continuity) plus the character panels, so Kontext keeps
+            # the room and the cast while having full freedom to render THIS scene's pose.
+            #
+            # (We tried an img2img edit of the start frame to pixel-lock the background, but
+            # at any denoise low enough to hold the room it also reproduced the pose — and
+            # chaining each page off the previous page's output made a same-location run
+            # converge to one frozen frame. Background continuity across clips is handled
+            # instead by frame-chaining in Phase B + Wan I2V anchoring to the start frame.)
+            if use_kontext:
+                _route = "kontext" + (" (location cut)" if is_location_cut else "")
+                wf_end = build_flux_kontext_workflow(
+                    prompt=end_prompt, width=width, height=height,
+                    seed=end_seed, reference_image=composite_ref_name, steps=kontext_steps,
+                )
             else:
-                _route = "FLF2V plain-flux (no kontext)"
+                _route = "plain-flux (no kontext)"
+                wf_end = build_flux_image_workflow(ImageGenerateParams(
+                    image_mode="create", prompt=end_prompt,
+                    width=width, height=height, seed=end_seed, model="flux",
+                ))
             print(f"[storybook] page {i+1}: {_route}")
-            if not use_flf2v:
-                # ---- Pure background-locked I2V: no end keyframe ----
-                # The clip animates from the start frame using the motion prompt; Wan I2V
-                # holds the input background. The next page chains on this clip's ACTUAL
-                # last frame (Phase B), and the bg-anchor proxy for the next page is this
-                # page's own start frame (the room continues).
-                end_input_for_kf = ""
-                end_out = page_thumb
-                prev_end_image_filename = page_thumb
-            else:
-                start_edit_exists = (COMFY_INPUT / start_image_input_name).exists()
-                if use_kontext and not is_location_cut and start_edit_exists:
-                    # ---- Background-locked FLF2V: img2img edit of the start frame ----
-                    # Same room as the start frame → edit it in place (denoise < 1.0) so the
-                    # background is preserved and only the pose changes. Single-character
-                    # scenes reference the start frame itself; multi-character scenes keep
-                    # the composite so the supporting cast stays locked.
-                    edit_ref = composite_ref_name if multi_char else start_image_input_name
-                    wf_end = build_flux_kontext_edit_workflow(
-                        prompt=end_prompt, seed=end_seed,
-                        edit_image=start_image_input_name, reference_image=edit_ref,
-                        steps=kontext_steps + 4,   # img2img needs a touch more than from-scratch
-                    )
-                elif use_kontext:
-                    # Location cut → new room must be generated from scratch.
-                    wf_end = build_flux_kontext_workflow(
-                        prompt=end_prompt, width=width, height=height,
-                        seed=end_seed, reference_image=composite_ref_name, steps=kontext_steps,
-                    )
-                else:
-                    wf_end = build_flux_image_workflow(ImageGenerateParams(
-                        image_mode="create", prompt=end_prompt,
-                        width=width, height=height, seed=end_seed, model="flux",
-                    ))
-                end_out = await _submit_comfy_and_wait(wf_end, timeout_s=300)
-                shutil.copyfile(str(COMFY_OUTPUT / end_out), str(COMFY_INPUT / end_image_input_name))
-                end_input_for_kf = end_image_input_name
-                prev_end_image_filename = end_out
+            end_out = await _submit_comfy_and_wait(wf_end, timeout_s=300)
+            shutil.copyfile(str(COMFY_OUTPUT / end_out), str(COMFY_INPUT / end_image_input_name))
+            end_input_for_kf = end_image_input_name
+            prev_end_image_filename = end_out
             # Bookkeeping for the next iteration's bg-anchor decision.
             prev_loc_id = loc_id
             prev_objects = list(objects_in_hand)
@@ -670,7 +641,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                     "end_image": end_out,
                     "start_input_name": start_image_input_name,
                     "end_input_name": end_input_for_kf,
-                    "use_flf2v": use_flf2v,
+                    "use_flf2v": True,   # every page now renders an FLF2V end keyframe
                     "description": scene_desc,
                     "motion_intensity": intensity,
                     "start_prompt": start_prompt,
@@ -859,8 +830,10 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         })
         save_json(HISTORY_FILE, items[:200])
     except Exception as e:
-        print(f"[storybook] {e}")
-        state.last_error = f"storybook failed: {e}"
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[storybook] FAILED: {type(e).__name__}: {e}\n{tb}")
+        state.last_error = f"storybook failed: {type(e).__name__}: {e}".rstrip(": ")
     finally:
         state.active_gen = None
 

@@ -26,18 +26,16 @@ silent MP4 you can watch on the couch.
   across all scenes; supporting characters get model-sheet refs; each clip starts
   from the *actual last rendered frame* of the previous clip so pose continuity is
   exact. CLIP-vision drift detection flags scenes where the character has drifted.
-- **Background continuity** — locations are first-class entities. Same-location
-  beats regenerate the end keyframe as an **img2img Kontext edit of the start
-  frame** (preserve the room, change only the pose), and re-anchor only on a real
-  location change — so the kitchen Bolt is in stays the *same* kitchen instead of
-  reshuffling every page.
+- **Background continuity** — locations are first-class entities. Each scene's
+  Kontext keyframe is anchored on a consistent background panel (the location ref,
+  or the previous scene's end frame for same-location runs), and the *animated*
+  continuity is carried by frame-chaining: every Wan clip starts from the previous
+  clip's real last frame and Wan's I2V holds that background forward — so the
+  kitchen Bolt is in stays the same kitchen across the cut.
 - **Seamless cuts** — pages chain on the previous clip's real last frame and stitch
   with a short crossfade, so the page-to-page seams read as one continuous shot
   instead of popping. The camera is locked per clip (no per-shot dolly/pan that
   would jump at every cut).
-- **Hybrid keyframes** — a pose-delta classifier routes each scene: ambient beats
-  animate as pure image-to-video (background held by Wan), real pose beats get a
-  background-locked Kontext keyframe, and genuine location changes render fresh.
 - **Object continuity** — every scene declares what the protagonist is holding;
   the LLM critique pass refuses plans where props appear from thin air.
 - **Character library** — save a protagonist from a finished storybook and re-use
@@ -188,7 +186,7 @@ cd studio/backend
 
 It posts a `smoke: true` storybook, watches progress, then writes the seam frames to
 `output/smoke_seams_<id>/`. The backend log prints each page's keyframe route
-(`pure-I2V` / `img2img background-locked` / `from-scratch location cut`).
+(`kontext` / `kontext (location cut)` / `plain-flux`).
 
 ## Remote access (optional)
 

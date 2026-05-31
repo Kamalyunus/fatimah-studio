@@ -163,26 +163,21 @@ For each scene, in order:
 
 2. **Composite Kontext reference.** Kontext only takes one image, so we build a
    left-to-right strip `[ bg_anchor | char1 | char2 | ... ]` where:
-   - `bg_anchor` is either the canonical **location ref** (location change, or
-     start of a new same-location chain), or the **previous scene's end image**
-     (same location, within the chain cap). The 3-scene cap bounds compounding
-     drift; after that we re-anchor.
+   - `bg_anchor` is either the canonical **location ref** (on a location change), or
+     the **previous scene's end image** (for same-location runs — re-anchoring only
+     when the location actually changes, so a long same-location run keeps inheriting
+     the established room).
    - The character panels lock each visible character's appearance.
 
-3. **END frame (hybrid).** A pose-delta classifier (`_poses_differ`, plus
-   `motion_intensity == dynamic`, an object change, or a location cut) decides
-   whether this scene even *needs* an end keyframe:
-   - **Ambient beat** (start ≈ end pose): **no end frame** — the scene animates as
-     pure image-to-video and Wan holds the start frame's background.
-   - **Real beat, same location:** the end frame is an **img2img Kontext edit of the
-     start frame** (`build_flux_kontext_edit_workflow`, denoise `0.6`) — it samples
-     from the start frame's own latent rather than empty noise, so the background is
-     preserved and only the pose changes. This is the fix for "the room reshuffles
-     every page."
-   - **Location cut:** a from-scratch Kontext render of the new room.
-
-   In every case the prompt leads with the pose change, then setting-lock language,
-   then `prev_link`, then the object clause.
+3. **END frame.** A from-scratch Flux Kontext render on that composite, prompted with
+   the pose change first, then setting-lock language, then `prev_link`, then the
+   object clause. Generating from empty noise (denoise 1.0) gives full freedom to
+   render *this* scene's pose/action — the load-bearing requirement, since a storybook
+   page is always a distinct beat. (An earlier experiment edited the start frame
+   img2img to pixel-lock the background, but at any denoise low enough to hold the room
+   it also reproduced the pose, and chaining each page off the previous output froze
+   whole same-location runs onto one frame. Background continuity is instead carried at
+   the Wan level — see Phase B chaining + start-frame anchoring.)
 
 4. **Cache.** Every scene's prompt, seed, composite ref name, keyframe filenames,
    motion timeline, camera, objects, and assembled Wan prompt are stashed on the
@@ -216,8 +211,9 @@ Wan 2.2 14B I2V:
   target, so chaining on the *rendered* frame is what makes the seam invisible by
   construction. (Page 1, and the page right after a location cut, start from their
   own keyframe.)
-- `end_image` = the page's end frame for **FLF2V** beats; **empty** for ambient
-  beats, which run as pure I2V and hold the background.
+- `end_image` = the page's end keyframe (every page runs **FLF2V**, start → end).
+  Wan I2V is strongly anchored to the start frame, so within a clip the background
+  largely holds even if the end keyframe's room drifts slightly.
 - **Camera is forced static** (`Camera: locked, no movement`). Independent per-clip
   dolly/pan moves end at one framing and the next clip starts a different move from a
   different framing — a major source of seam pops — so they're stripped (the LLM's
@@ -239,9 +235,9 @@ motion-velocity discontinuity so the action eases across the cut instead of
 stop-starting. Output: `wan_studio_storybook_<gen_id>.mp4`.
 
 The history entry persists: the full plan, `scenes_meta` (every keyframe context,
-including `use_flf2v` and the chained start frame), `locations_meta`, the
-protagonist's reference filename. This is enough to drive the per-scene Wan-regen
-flow without re-running anything else.
+including the chained start frame), `locations_meta`, the protagonist's reference
+filename. This is enough to drive the per-scene Wan-regen flow without re-running
+anything else.
 
 ### Smoke-test mode
 
@@ -250,30 +246,34 @@ to `SMOKE_PAGES` (3), Wan at 8 steps / 33 frames, Kontext at 10 steps, and the
 keyframe approval gate auto-approved so it completes unattended in a few minutes
 instead of hours. The backend logs each page's keyframe route, and `smoke_test.py`
 posts the job, watches `/api/state`, and extracts the frames either side of every
-seam into `output/smoke_seams_<id>/`. Purpose: validate the background-lock, the
-frame chaining, and the crossfade before committing to a full-length run.
+seam into `output/smoke_seams_<id>/`. Purpose: validate page-to-page progression,
+the frame chaining, and the crossfade seams before committing to a full-length run.
 
 ## Background continuity
 
-The default failure mode of generating each Kontext scene from empty noise is that
-the background reshuffles every page — the kitchen Bolt was just in becomes a
-*different* kitchen on the next page (a fridge appears, jars rearrange). Three
-mechanisms, in order of impact, keep the room stable:
+A storybook needs two things that pull against each other: the **pose/action must
+change** every page (it's a different beat), but the **room should stay the same**
+within a location. Generating each keyframe from empty noise gives full pose freedom
+but lets the background reshuffle (a fridge appears, jars rearrange); pixel-locking the
+background (img2img edit at low denoise) holds the room but freezes the pose and, when
+chained page-to-page, collapses a whole same-location run onto one frame. We keep pose
+freedom and recover continuity at the *animation* level instead of the keyframe level:
 
-- **img2img end keyframes (the load-bearing fix).** For a same-location beat, the end
-  frame is generated by `build_flux_kontext_edit_workflow`, which seeds the sampler
-  from the start frame's *own* latent at denoise `0.6` instead of empty noise. The
-  existing composition — crucially the background — survives; only the character's
-  pose moves. The old path sampled from `EmptySD3LatentImage` at denoise `1.0` and
-  re-invented the whole room every call.
-- **Prev-end as the background anchor.** The leftmost panel of the Kontext composite
-  is scene N-1's end image when the location is unchanged, with hard "preserve the
-  EXACT room" prompt language. Re-anchoring to the canonical location ref now happens
-  **only on a genuine location change** (the old 3-scene chain cap that forced a
-  periodic re-render — and a periodic background pop — is removed).
-- **Frame chaining into Wan.** Even with matched keyframes, the *rendered* clips are
-  what the viewer sees, so each clip starts from the previous clip's real last frame
-  (Phase B) and Wan I2V holds that background forward.
+- **Consistent background anchoring.** The leftmost panel of the Kontext composite is
+  scene N-1's end image when the location is unchanged (hard "preserve the EXACT room"
+  prompt language), re-anchoring to the canonical location ref **only on a genuine
+  location change**. This keeps the rendered rooms similar without dictating the pose.
+- **Frame chaining into Wan (the load-bearing piece).** The *rendered* clips are what
+  the viewer sees, so each clip starts from the previous clip's real last frame
+  (Phase B), making the seam itself continuous regardless of keyframe drift.
+- **Wan I2V start-anchoring.** Within a clip, Wan holds the start frame's background
+  while moving the character toward the end keyframe's pose, so even a from-scratch end
+  keyframe with a slightly different room doesn't morph the room mid-shot much.
+
+(`build_flux_kontext_edit_workflow` — the img2img background-lock builder — remains in
+the codebase but is unused by the orchestrator after the freeze-on-one-frame regression;
+it would need region masking / inpainting to lock the background without freezing the
+pose.)
 
 ## Object continuity
 
@@ -321,8 +321,7 @@ The chain that produced kid-readable continuity, in order of impact:
 
 All wired into both the high-noise and low-noise samplers. Frame count is 81 for a
 full run (Wan 2.2's trained sweet spot for ~5 s); smoke mode drops to 33 frames /
-8 steps. `KONTEXT_EDIT_DENOISE` (0.6) and `XFADE_DUR` (0.18 s) are the two visual
-tunables for the background-lock strength and the seam crossfade.
+8 steps. `XFADE_DUR` (0.18 s) tunes the seam crossfade length.
 
 ## LLM behavior
 
