@@ -270,10 +270,10 @@ freedom and recover continuity at the *animation* level instead of the keyframe 
   while moving the character toward the end keyframe's pose, so even a from-scratch end
   keyframe with a slightly different room doesn't morph the room mid-shot much.
 
-(`build_flux_kontext_edit_workflow` — the img2img background-lock builder — remains in
-the codebase but is unused by the orchestrator after the freeze-on-one-frame regression;
-it would need region masking / inpainting to lock the background without freezing the
-pose.)
+(An img2img background-lock builder was tried and removed: at any denoise low enough to
+hold the room it froze the pose, and chaining each page off the previous output collapsed
+same-location runs onto one frame. Properly locking the background without freezing the
+pose would need region masking / inpainting.)
 
 ## Object continuity
 

@@ -13,7 +13,6 @@ from config import (
     FLUX_MODEL,
     FLUX_T5,
     FLUX_VAE,
-    KONTEXT_EDIT_DENOISE,
     SDXL_LIGHTNING_LORA,
     SDXL_MODEL,
     UPSCALER_MODEL,
@@ -86,75 +85,6 @@ def build_flux_kontext_workflow(prompt: str, width: int, height: int, seed: int,
             "class_type": "VAEDecode",
             "inputs": {"samples": ["sampler", 0], "vae": ["vae", 0]},
         },
-        "save": {
-            "class_type": "SaveImage",
-            "inputs": {"images": ["decode", 0], "filename_prefix": "wan_studio_image_flux"},
-        },
-    }
-
-
-def build_flux_kontext_edit_workflow(
-    prompt: str, seed: int, edit_image: str, reference_image: str | None = None,
-    steps: int = 24, denoise: float = KONTEXT_EDIT_DENOISE,
-) -> dict:
-    """Flux Kontext as an IMG2IMG edit (background-locked end-keyframe).
-
-    Unlike build_flux_kontext_workflow — which samples from an EMPTY latent at denoise 1.0
-    and therefore re-invents the whole scene (props/furniture reshuffle every call) — this
-    starts the sampler from edit_image's OWN latent at partial denoise, so the existing
-    composition, crucially the BACKGROUND, is preserved while the prompt nudges the
-    character into the new pose. Used for same-location storybook end-keyframes so the room
-    stays pixel-stable across the clip. reference_image (defaults to edit_image) supplies the
-    Kontext ReferenceLatent that locks appearance — pass the multi-character composite when
-    other characters must be held."""
-    ref = reference_image or edit_image
-    return {
-        "unet": {
-            "class_type": "UNETLoader",
-            "inputs": {"unet_name": FLUX_KONTEXT_MODEL, "weight_dtype": "default"},
-        },
-        "clip": {
-            "class_type": "DualCLIPLoader",
-            "inputs": {"clip_name1": FLUX_CLIP_L, "clip_name2": FLUX_T5, "type": "flux"},
-        },
-        "vae": {"class_type": "VAELoader", "inputs": {"vae_name": FLUX_VAE}},
-        # img2img base — the page's start frame (correct room + character).
-        "load_edit": {"class_type": "LoadImage", "inputs": {"image": edit_image}},
-        "scale_edit": {"class_type": "FluxKontextImageScale", "inputs": {"image": ["load_edit", 0]}},
-        "encode_edit": {"class_type": "VAEEncode", "inputs": {"pixels": ["scale_edit", 0], "vae": ["vae", 0]}},
-        # appearance-lock reference (Kontext context tokens).
-        "load_ref": {"class_type": "LoadImage", "inputs": {"image": ref}},
-        "scale_ref": {"class_type": "FluxKontextImageScale", "inputs": {"image": ["load_ref", 0]}},
-        "encode_ref": {"class_type": "VAEEncode", "inputs": {"pixels": ["scale_ref", 0], "vae": ["vae", 0]}},
-        "positive": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["clip", 0]}},
-        "ref_latent": {
-            "class_type": "ReferenceLatent",
-            "inputs": {"conditioning": ["positive", 0], "latent": ["encode_ref", 0]},
-        },
-        "guidance": {
-            "class_type": "FluxGuidance",
-            "inputs": {"conditioning": ["ref_latent", 0], "guidance": 3.5},
-        },
-        "negative": {
-            "class_type": "ConditioningZeroOut",
-            "inputs": {"conditioning": ["positive", 0]},
-        },
-        "sampler": {
-            "class_type": "KSampler",
-            "inputs": {
-                "model": ["unet", 0],
-                "positive": ["guidance", 0],
-                "negative": ["negative", 0],
-                "latent_image": ["encode_edit", 0],   # <-- start from the start-frame latent
-                "steps": steps,
-                "cfg": 1.0,
-                "sampler_name": "euler",
-                "scheduler": "simple",
-                "denoise": denoise,
-                "seed": seed,
-            },
-        },
-        "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sampler", 0], "vae": ["vae", 0]}},
         "save": {
             "class_type": "SaveImage",
             "inputs": {"images": ["decode", 0], "filename_prefix": "wan_studio_image_flux"},

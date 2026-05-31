@@ -18,8 +18,6 @@ orchestration lives in storybook.py.
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 import shutil
 import time
 import uuid
@@ -31,9 +29,8 @@ import httpx
 import websockets
 from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 
-import drift
 import llm
 import state
 import storybook
@@ -42,10 +39,7 @@ from models import *            # noqa: F401,F403  — request models
 from workflows import *         # noqa: F401,F403  — workflow builders
 from comfy import (
     _comfy_free,
-    _extract_last_frame,
     _generate_thumb,
-    _probe_duration,
-    _stitch_videos,
     _submit_comfy_and_wait,
 )
 from state import GenState
@@ -330,21 +324,8 @@ async def storybook_regenerate_keyframe(p: RegenerateKeyframeParams):
         await storybook._rescore_drift_for_active()
         return {"ok": True, "filename": out}
     else:
-        if not kf.get("end_input_name"):
-            raise HTTPException(409, "this is an ambient (pure-I2V) scene with no end keyframe to regenerate")
         prompt_text = kf["end_prompt"]
-        # Mirror generation: same-room scenes use the img2img edit (background-locked);
-        # only a from-scratch render if the start frame is unavailable.
-        start_in = kf.get("start_input_name") or ""
-        if kontext_available and start_in and (COMFY_INPUT / start_in).exists() and not (
-            kf.get("bg_anchor_kind") == "loc_ref" and p.scene_index > 0
-        ):
-            edit_ref = composite_ref if len(kf.get("characters_in_scene", [])) > 1 else start_in
-            wf = build_flux_kontext_edit_workflow(
-                prompt=prompt_text, seed=new_seed,
-                edit_image=start_in, reference_image=edit_ref,
-            )
-        elif kontext_available:
+        if kontext_available:
             wf = build_flux_kontext_workflow(
                 prompt=prompt_text, width=width, height=height,
                 seed=new_seed, reference_image=composite_ref, steps=20,
@@ -392,9 +373,7 @@ async def storybook_regenerate_scene(p: RegenerateSceneParams):
     if not (COMFY_INPUT / chain_start).exists():
         chain_start = target["start_input_name"]
     target["_resolved_start_input"] = chain_start
-    # end_input_name is empty for pure-I2V (ambient) scenes — only validate it when set.
-    required = [chain_start] + ([target["end_input_name"]] if target.get("end_input_name") else [])
-    for fname in required:
+    for fname in (chain_start, target["end_input_name"]):
         if not (COMFY_INPUT / fname).exists():
             raise HTTPException(409, f"input frame '{fname}' is no longer on disk — can't regen")
 

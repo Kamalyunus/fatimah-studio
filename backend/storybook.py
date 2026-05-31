@@ -5,7 +5,6 @@ Mutates the shared singleton via `state.active_gen` so the routes can report pro
 drive the keyframe-approval gate."""
 from __future__ import annotations
 
-import re
 import shutil
 import time
 from pathlib import Path
@@ -31,37 +30,9 @@ from models import GenerateParams, ImageGenerateParams, StorybookParams
 from store import load_json, save_json
 from workflows import (
     build_flux_image_workflow,
-    build_flux_kontext_edit_workflow,
     build_flux_kontext_workflow,
     build_wan22_i2v_workflow,
 )
-
-
-_POSE_STOPWORDS = {
-    "the", "and", "with", "his", "her", "its", "their", "they", "are", "for", "into",
-    "onto", "from", "out", "off", "but", "not", "near", "over", "this", "that",
-    "slightly", "gently", "softly", "faintly", "slowly", "still", "while", "then",
-}
-
-
-def _poses_differ(start_pose: str, end_pose: str, threshold: float = 0.7) -> bool:
-    """True when start and end poses describe a meaningfully different body state.
-
-    Compares content-word sets (Jaccard similarity). The cookie-story LLM leaves
-    object_change empty, but always emits rich pose text, so the pose delta — not the
-    object fields — is the reliable signal for 'does this scene have a real beat that needs
-    a Kontext end-keyframe?'. Near-identical poses (ambient beats) return False and the
-    scene animates as pure background-locked I2V instead."""
-    def toks(s: str) -> set[str]:
-        return {w for w in re.findall(r"[a-z]+", (s or "").lower())
-                if w not in _POSE_STOPWORDS and len(w) > 2}
-    a, b = toks(start_pose), toks(end_pose)
-    if not a and not b:
-        return False
-    if not a or not b:
-        return True
-    sim = len(a & b) / len(a | b)
-    return sim < threshold
 
 
 def _sanitize_char_name(name: str) -> str:
@@ -641,7 +612,6 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                     "end_image": end_out,
                     "start_input_name": start_image_input_name,
                     "end_input_name": end_input_for_kf,
-                    "use_flf2v": True,   # every page now renders an FLF2V end keyframe
                     "description": scene_desc,
                     "motion_intensity": intensity,
                     "start_prompt": start_prompt,
@@ -732,9 +702,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 fps=16, scheduler="unipc",
                 noise_aug=NOISE_AUG_BY_INTENSITY.get(kf["motion_intensity"], 0.05),
                 image=start_input,
-                # Empty for pure-I2V (ambient) pages → Wan animates from the start frame
-                # only and holds its background. Set for FLF2V (beat) pages.
-                end_image=kf.get("end_input_name") or "",
+                end_image=kf["end_input_name"],
                 multi_gpu=True,
                 attention_mode="sageattn",
                 block_swap_count=15, block_swap_device="cuda:1",
@@ -780,7 +748,6 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 # frame, except at a location cut). Falls back to start_input_name.
                 "chain_start_input_name": kf.get("chain_start_input_name", kf["start_input_name"]),
                 "end_input_name": kf["end_input_name"],
-                "use_flf2v": kf.get("use_flf2v", bool(kf["end_input_name"])),
                 "video": kf.get("video"),
                 "wan_prompt": kf["wan_prompt"],
                 "motion_intensity": kf["motion_intensity"],
@@ -900,7 +867,7 @@ async def _do_regenerate_scene(gen_id: str, scene_index: int, target: dict, para
             fps=16, scheduler="unipc",
             noise_aug=NOISE_AUG_BY_INTENSITY.get(target.get("motion_intensity") or "gentle", 0.05),
             image=target.get("_resolved_start_input") or target["start_input_name"],
-            end_image=target.get("end_input_name") or "",
+            end_image=target["end_input_name"],
             multi_gpu=True,
             attention_mode="sageattn",
             block_swap_count=15, block_swap_device="cuda:1",

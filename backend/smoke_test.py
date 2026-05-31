@@ -77,7 +77,7 @@ def main() -> int:
     gen_id = info["gen_id"]
     final_name = f"wan_studio_storybook_{gen_id}.mp4"
     print(f"   gen_id={gen_id}  → final video will be {final_name}")
-    print("   watching progress (backend console shows per-page routing: pure-I2V / img2img / from-scratch)…")
+    print("   watching progress (backend console shows per-page keyframe route: kontext / location-cut / plain-flux)…")
 
     last_node = None
     t0 = time.time()

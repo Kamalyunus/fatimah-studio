@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import json
-import re
-from typing import Any, Optional
+from typing import Optional
 
 from llm.client import _chat
 from llm.prompts import (

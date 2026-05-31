@@ -41,12 +41,6 @@ UPSCALER_MODEL = "4x-UltraSharp.pth"
 DEFAULT_NEGATIVE = "blurry, low quality, distorted, bad anatomy, watermark, text, jpeg artifacts, deformed, ugly"
 
 # ---------- Tunables ----------
-# Denoise for the img2img Kontext end-keyframe edit. Lower = background locked harder but
-# pose moves less; higher = pose moves more but the room drifts. 0.6 keeps the room while
-# letting the character change pose. Tune if actions look too subtle (raise) or the
-# background still drifts (lower).
-KONTEXT_EDIT_DENOISE = 0.6
-
 # Crossfade between stitched clips: ~3 frames @ 16fps — short enough to read as a smooth
 # seam, not a visible dissolve. Paired with last-frame chaining (the boundary frames are
 # near-identical), it mainly absorbs the small motion-velocity discontinuity at each cut.
@@ -66,9 +60,8 @@ STORY_ASPECT_DIMS = {
     "portrait":  (576, 1024),
 }
 
-# Pages used in smoke-test mode (StorybookParams.smoke). 3 gives: an opening ambient page
-# (pure I2V), a same-location beat (img2img background-lock), and one more — so a single
-# run exercises both keyframe paths and ≥2 stitched seams.
+# Pages used in smoke-test mode (StorybookParams.smoke). 3 gives a couple of
+# same-location beats plus at least one location cut, exercising ≥2 stitched seams.
 SMOKE_PAGES = 3
 
 # Persistent WebSocket client id the backend uses to monitor every gen's ComfyUI events.

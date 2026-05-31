@@ -1,7 +1,6 @@
 """Ollama transport: chat completion, VRAM unload, availability check + model config."""
 from __future__ import annotations
 
-import json
 from typing import Any
 import re
 

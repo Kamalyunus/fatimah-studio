@@ -2,7 +2,6 @@
 No I/O — safe to call anywhere."""
 from __future__ import annotations
 
-import re
 
 def render_canon(canon: dict | None) -> str:
     """Render a single character canon dict as a descriptive clause used verbatim in
