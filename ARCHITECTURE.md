@@ -8,7 +8,7 @@ on a dual-3090 home rig.
 
 | Layer                  | Component                                                | Why                                                                          |
 |------------------------|----------------------------------------------------------|------------------------------------------------------------------------------|
-| UI                     | React + Tailwind, Vite dev server (port 3000)            | Snappy, mobile-friendly, easy to make kid-readable                           |
+| UI                     | React + Tailwind, static build served by the backend (:8000) | Snappy, mobile-friendly, kid-readable; one process, no separate dev server to run or reap |
 | Backend / orchestrator | FastAPI on 8000                                          | One service that builds workflow JSON and runs the storybook pipeline        |
 | Diffusion runtime      | ComfyUI on 8188                                          | Kijai's WanVideoWrapper + MultiGPU                                           |
 | Video model            | Wan 2.2 14B I2V (MoE: high-noise + low-noise expert)     | SOTA quality at FP8 in 2024–2025, robust FLF2V via end-frame guidance        |
@@ -387,6 +387,13 @@ request via ffmpeg and cached as JPG in `studio/backend/thumbs/`.
 
 ## Frontend conventions
 
+- **Served by the backend, not a dev server.** `npm run build` emits `frontend/dist/`,
+  which `main.py` mounts with `StaticFiles(html=True)` at `/` — declared *after* every
+  `/api/*` route so the API keeps precedence. The UI and API are therefore same-origin
+  on `:8000`; `lib/api.ts` calls `/api/...` with no proxy. There is no long-lived
+  node/vite process in production (one fewer thing to run, and nothing for an external
+  process manager to reap). Rebuild after UI changes — the backend serves the new files
+  with no restart.
 - **One context, no Redux.** `StudioProvider` holds the small global state (server
   poll results, current result, history, theme, profile). Each panel keeps its own
   local form state.
@@ -403,9 +410,10 @@ request via ffmpeg and cached as JPG in `studio/backend/thumbs/`.
 
 ## Why no public exposure?
 
-The frontend is the only thing listening on `0.0.0.0` and the backend / ComfyUI /
-Ollama all stay on `127.0.0.1`. Remote access goes through Meshnet — peer-to-peer,
-encrypted, no ports opened to the public internet. Every device that wants access
+Everything binds `127.0.0.1` by default — the backend (which serves both the UI and
+the `/api` routes on `:8000`), ComfyUI, and Ollama. Nothing is exposed to the public
+internet. Remote access goes through Meshnet — peer-to-peer, encrypted — after binding
+the backend to `0.0.0.0` (see README → *Remote access*). Every device that wants access
 needs Meshnet installed, but for a family use-case that's a feature.
 
 ## Things deliberately left simple

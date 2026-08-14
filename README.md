@@ -62,13 +62,13 @@ silent MP4 you can watch on the couch.
 
 ```
                   ┌────────────────────────────────────────────────────┐
-   browser ─────► │ React + Tailwind frontend (Vite, 3000)             │
-                  │   • Storybook tab   • Picture tab                  │
+   browser ─────► │ React + Tailwind UI  • Storybook tab • Picture tab │
+                  │ static build, served by the backend (no dev server)│
                   └─────────────────────┬──────────────────────────────┘
-                                        │ /api/*
+                                        │ same origin, /api/*
                                         ▼
                   ┌────────────────────────────────────────────────────┐
-                  │ FastAPI backend (8000) — main.py + modules         │
+                  │ FastAPI backend (8000) — serves the built UI + /api│
                   │   • workflows/  builds ComfyUI workflow JSON       │
                   │   • storybook   orchestrates the pipeline          │
                   │   • comfy/state submit + track the active gen      │
@@ -131,7 +131,8 @@ studio/
     │   │   └── ProgressDisplay.tsx    friendly progress messaging
     │   ├── lib/{api,store,presets,user,utils}.ts
     │   └── types.ts
-    └── vite.config.ts              listens on 0.0.0.0:3000, proxies /api → 127.0.0.1:8000
+    ├── vite.config.ts              build config (dev-server proxy kept for `npm run dev`)
+    └── dist/                       production build — `npm run build`; served by the backend at :8000
 ```
 
 ## Prerequisites
@@ -158,17 +159,21 @@ studio/
 ComfyUI must already be up on port 8188 with the custom nodes loaded. Then:
 
 ```bash
-# Backend
-cd studio/backend
-/home/yunus/Documents/comfyui/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
-
-# Frontend
+# Frontend — build once (re-run after any UI code change; there is no hot reload)
 cd studio/frontend
 npm install
-npm run dev -- --host 0.0.0.0
+npm run build            # → frontend/dist/
+
+# Backend — serves the built UI *and* the /api routes on a single port
+cd ../backend
+/home/yunus/Documents/comfyui/venv/bin/python main.py    # binds 127.0.0.1:8000
 ```
 
-Open `http://fatimahstudio.local:3000/` on the LAN, or `http://localhost:3000/`.
+Open `http://localhost:8000/`. The backend serves the compiled frontend and the
+`/api` routes from the same origin, so there is **no separate dev-server process** to
+run or keep alive. (Editing UI code? Re-run `npm run build`; the backend picks up the
+new files immediately, no restart needed. For live hot-reload while developing, you
+can still `npm run dev` — it proxies `/api` to `:8000` on its own port.)
 
 (On my box, the backend is a `fatimah-backend.service` user unit that depends on
 the `More Data` drive being mounted via fstab so the model weights are reachable.)
@@ -190,11 +195,13 @@ It posts a `smoke: true` storybook, watches progress, then writes the seam frame
 
 ## Remote access (optional)
 
-The frontend listens on `0.0.0.0:3000`; the backend, ComfyUI, and Ollama all stay
-on `127.0.0.1`. For "from anywhere" access without exposing anything to the public
-internet, the studio runs over **NordVPN Meshnet** (free, peer-to-peer). Enable
-Meshnet on this machine and any phone/laptop you want to use, then visit
-`http://<meshnet-ip>:3000/`.
+By default everything binds `127.0.0.1` (local-only) — the backend that serves the UI
+on `:8000`, ComfyUI, and Ollama. For LAN or "from anywhere" access, bind the backend
+to all interfaces: change the `uvicorn.run(..., host="127.0.0.1")` line at the bottom
+of `backend/main.py` to `host="0.0.0.0"` (or launch it as
+`uvicorn main:app --host 0.0.0.0 --port 8000`). Then reach it over **NordVPN Meshnet**
+(free, peer-to-peer, nothing exposed to the public internet): enable Meshnet on this
+machine and any phone/laptop, then visit `http://<meshnet-ip>:8000/`.
 
 ## Status
 

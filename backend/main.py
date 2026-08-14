@@ -30,6 +30,7 @@ import websockets
 from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 import llm
 import state
@@ -629,6 +630,19 @@ async def get_thumb(filename: str):
         if not _generate_thumb(video_path, thumb_path):
             raise HTTPException(500, "thumbnail extraction failed")
     return FileResponse(thumb_path, media_type="image/jpeg")
+
+
+# Serve the built frontend (vite `dist/`) from this same process, so there is no
+# separate node/vite dev server to run (or for external process managers to reap).
+# Mounted LAST so every /api/* route above takes precedence; html=True serves
+# index.html at "/". The app is single-page (view state in localStorage), so a
+# plain static mount is sufficient — same-origin means the frontend's "/api" calls
+# hit these routes directly with no proxy.
+_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if _FRONTEND_DIST.is_dir():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="frontend")
+else:
+    print(f"[main] frontend build not found at {_FRONTEND_DIST} — run `npm run build` in studio/frontend")
 
 
 if __name__ == "__main__":
