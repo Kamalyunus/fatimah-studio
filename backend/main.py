@@ -647,4 +647,6 @@ else:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+    # 0.0.0.0 so the app is reachable over the LAN and NordVPN Meshnet; ComfyUI and
+    # Ollama stay loopback-only — this is the single externally-visible port.
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
