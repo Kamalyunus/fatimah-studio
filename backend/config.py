@@ -28,6 +28,18 @@ CLIP_VISION_MODEL = "open-clip-xlm-roberta-large-vit-huge-14_visual_fp32.safeten
 WAN22_I2V_HIGH = "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
 WAN22_I2V_LOW = "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
 
+# ---------- VACE (reference-conditioned animation) ----------
+# VACE replaces the I2V conditioning path: start/end keyframes go in as masked control
+# frames and the character sheet goes in as a reference image, so Wan maintains character
+# identity DURING animation instead of only at the keyframes. The VACE modules attach to
+# the Wan 2.2 *T2V* base experts (not I2V) via the model loader's vace_model input.
+USE_VACE = True                     # storybook Phase B routes to the VACE workflow
+WAN22_T2V_HIGH = "Wan2_2-T2V-A14B_HIGH_fp8_e4m3fn_scaled_KJ.safetensors"
+WAN22_T2V_LOW = "Wan2_2-T2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors"
+WAN22_VACE_HIGH = "Wan2_2_Fun_VACE_module_A14B_HIGH_fp8_e4m3fn_scaled_KJ.safetensors"
+WAN22_VACE_LOW = "Wan2_2_Fun_VACE_module_A14B_LOW_fp8_e4m3fn_scaled_KJ.safetensors"
+VACE_STRENGTH = 1.0                 # vace_context scale; 1.0 = full conditioning
+
 # ---------- Image generation models ----------
 FLUX_MODEL = "flux1-schnell-fp8.safetensors"
 FLUX_T5 = "t5xxl_fp8_e4m3fn.safetensors"

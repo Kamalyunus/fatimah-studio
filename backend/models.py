@@ -32,6 +32,10 @@ class GenerateParams(BaseModel):
     # Wan FLF2V (first-last frame): provide explicit ending frame for guaranteed pose continuity
     end_image: str = ""
 
+    # VACE: character reference sheet (filename inside ComfyUI's input/) injected as a
+    # ref image so identity is enforced during animation, not just at the keyframes.
+    vace_ref_image: str = ""
+
     # Wan quality knobs (enable all by default for storybook quality)
     use_slg: bool = True       # Skip Layer Guidance — quality
     use_feta: bool = True      # Enhance-A-Video — motion smoothness

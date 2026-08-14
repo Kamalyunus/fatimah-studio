@@ -26,6 +26,12 @@ silent MP4 you can watch on the couch.
   across all scenes; supporting characters get model-sheet refs; each clip starts
   from the *actual last rendered frame* of the previous clip so pose continuity is
   exact. CLIP-vision drift detection flags scenes where the character has drifted.
+- **VACE reference-conditioned animation** — each page animates on Wan 2.2 T2V
+  experts with grafted Fun-VACE modules: the start/end keyframes go in as masked
+  control frames (first/last-frame guidance preserved) and the page's character
+  sheet goes in as a VACE reference, so the model holds the character's identity
+  in **every generated frame**, not just at the keyframes. Falls back to plain
+  I2V if a page has no reference sheet.
 - **Background continuity** — locations are first-class entities. Each scene's
   Kontext keyframe is anchored on a consistent background panel (the location ref,
   or the previous scene's end frame for same-location runs), and the *animated*
@@ -46,8 +52,9 @@ silent MP4 you can watch on the couch.
 - **Fast smoke-test mode** — a `smoke` flag runs a short, low-step, auto-approved
   3-page generation in a few minutes, so the coherency pipeline can be eyeballed
   before committing to a full-length, full-quality run.
-- **Quality stack on by default** — Wan 2.2 14B MoE (two-expert chain) with Skip
-  Layer Guidance, Enhance-A-Video, TeaCache, and SageAttention.
+- **Quality stack on by default** — Wan 2.2 14B MoE (two-expert chain, T2V+VACE
+  for storybooks) with Skip Layer Guidance, Enhance-A-Video, TeaCache, and
+  SageAttention.
 - **Dual-GPU aware** — block-swap to a second GPU keeps each 24 GB card from
   running out of VRAM. LLM unloads from VRAM before diffusion starts.
 - **Local & private** — Ollama (`qwen3.6:latest` for everything LLM), no
@@ -78,7 +85,7 @@ silent MP4 you can watch on the couch.
                         ▼                 ▼                          ▼
                 ┌──────────────┐  ┌──────────────┐         ┌──────────────────┐
                 │ ComfyUI 8188 │  │ Ollama 11434 │         │ CLIP-vit (CPU)   │
-                │ Wan 2.2 14B  │  │ qwen3.6      │         │ drift scoring    │
+                │ Wan2.2+VACE  │  │ qwen3.6      │         │ drift scoring    │
                 │ Flux schnell │  │              │         │                  │
                 │ Flux Kontext │  │              │         │                  │
                 │ Upscaler     │  │              │         │                  │
@@ -112,7 +119,7 @@ studio/
 │   ├── comfy.py         ComfyUI submit + ffmpeg media helpers (thumb, stitch, …)
 │   ├── state.py         GenState + active-gen singleton + ComfyUI monitor loops
 │   ├── storybook.py     Storybook orchestrator (plan → keyframes → Wan → stitch)
-│   ├── workflows/       Workflow builders — wan.py (Wan I2V), flux.py (Flux/SDXL)
+│   ├── workflows/       Workflow builders — wan.py (Wan I2V + VACE), flux.py (Flux/SDXL)
 │   ├── llm/             Ollama package — prompts, client, render, planning
 │   ├── drift.py         CLIP-vision drift scoring (CPU)
 │   ├── smoke_test.py    Fast end-to-end smoke runner (smoke-mode storybook)
@@ -144,6 +151,8 @@ studio/
 2. **Model weights** on a large drive (mine: `/media/yunus/More Data/comfyui-models/`),
    wired up via `extra_model_paths.yaml`:
    - Wan 2.2 I2V high + low noise FP8 (`wan2.2_i2v_*_14B_fp8_scaled.safetensors`)
+   - Wan 2.2 T2V A14B high + low FP8-scaled (`Wan2_2-T2V-A14B*_fp8_e4m3fn_scaled_KJ.safetensors`)
+   - Wan 2.2 Fun-VACE modules high + low (`Wan2_2_Fun_VACE_module_A14B_*_fp8_e4m3fn_scaled_KJ.safetensors`)
    - Wan 2.1 VAE + UMT5 XXL text encoder + Wan CLIP-vision
    - Flux schnell + Flux Kontext + Flux T5 + Flux CLIP-L + Flux VAE
    - SDXL base + SDXL Lightning LoRA (optional, fallback image model)

@@ -25,6 +25,7 @@ from config import (
     SMOKE_PAGES,
     STORY_ASPECT_DIMS,
     STYLE_PREFIXES,
+    USE_VACE,
 )
 from models import GenerateParams, ImageGenerateParams, StorybookParams
 from store import load_json, save_json
@@ -32,7 +33,19 @@ from workflows import (
     build_flux_image_workflow,
     build_flux_kontext_workflow,
     build_wan22_i2v_workflow,
+    build_wan22_vace_workflow,
 )
+
+
+def _build_wan_workflow(p: GenerateParams) -> dict:
+    """Route animation to VACE (reference-conditioned, identity held every frame) when
+    enabled and a ref is available; plain I2V otherwise. VACE needs its ref on disk —
+    a missing ref falls back to I2V rather than failing the page."""
+    if USE_VACE and p.vace_ref_image and (COMFY_INPUT / p.vace_ref_image).exists():
+        return build_wan22_vace_workflow(p)
+    if p.vace_ref_image and not (COMFY_INPUT / p.vace_ref_image).exists():
+        print(f"[storybook] vace ref {p.vace_ref_image} missing — falling back to I2V")
+    return build_wan22_i2v_workflow(p)
 
 
 def _sanitize_char_name(name: str) -> str:
@@ -703,6 +716,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 noise_aug=NOISE_AUG_BY_INTENSITY.get(kf["motion_intensity"], 0.05),
                 image=start_input,
                 end_image=kf["end_input_name"],
+                vace_ref_image=kf.get("composite_ref") or "",
                 multi_gpu=True,
                 attention_mode="sageattn",
                 block_swap_count=15, block_swap_device="cuda:1",
@@ -710,7 +724,9 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 keep_t5_loaded=True,
                 use_slg=True, use_feta=True, use_teacache=True,
             )
-            wf_v = build_wan22_i2v_workflow(i2v_params)
+            wf_v = _build_wan_workflow(i2v_params)
+            print(f"[storybook] page {i+1} animate: "
+                  f"{'vace ref=' + i2v_params.vace_ref_image if 'vace_encode' in wf_v else 'i2v'}")
             vid_filename = await _submit_comfy_and_wait(wf_v, timeout_s=2400)
             page_videos.append(str(COMFY_OUTPUT / vid_filename))
             kf["video"] = vid_filename   # remembered so per-scene-regen (#3) can find it later
@@ -868,6 +884,7 @@ async def _do_regenerate_scene(gen_id: str, scene_index: int, target: dict, para
             noise_aug=NOISE_AUG_BY_INTENSITY.get(target.get("motion_intensity") or "gentle", 0.05),
             image=target.get("_resolved_start_input") or target["start_input_name"],
             end_image=target["end_input_name"],
+            vace_ref_image=target.get("composite_ref") or "",
             multi_gpu=True,
             attention_mode="sageattn",
             block_swap_count=15, block_swap_device="cuda:1",
@@ -875,7 +892,7 @@ async def _do_regenerate_scene(gen_id: str, scene_index: int, target: dict, para
             keep_t5_loaded=True,
             use_slg=True, use_feta=True, use_teacache=True,
         )
-        wf = build_wan22_i2v_workflow(i2v_params)
+        wf = _build_wan_workflow(i2v_params)
         new_video = await _submit_comfy_and_wait(wf, timeout_s=2400)
 
         # Patch the history entry: swap in the new per-scene video filename, then restitch.

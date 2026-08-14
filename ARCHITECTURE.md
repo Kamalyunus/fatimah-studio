@@ -11,7 +11,7 @@ on a dual-3090 home rig.
 | UI                     | React + Tailwind, static build served by the backend (:8000) | Snappy, mobile-friendly, kid-readable; one process, no separate dev server to run or reap |
 | Backend / orchestrator | FastAPI on 8000                                          | One service that builds workflow JSON and runs the storybook pipeline        |
 | Diffusion runtime      | ComfyUI on 8188                                          | Kijai's WanVideoWrapper + MultiGPU                                           |
-| Video model            | Wan 2.2 14B I2V (MoE: high-noise + low-noise expert)     | SOTA quality at FP8 in 2024–2025, robust FLF2V via end-frame guidance        |
+| Video model            | Wan 2.2 14B MoE + Fun-VACE modules on the T2V experts    | Reference-conditioned animation: FLF control frames + identity ref every frame (I2V kept as fallback) |
 | Image model            | Flux schnell + Flux Kontext                              | Schnell is fast; Kontext locks character + setting via reference image       |
 | LLM                    | Ollama: `qwen3.6:latest` (Qwen3.5-MoE 36B, Q4_K_M)       | Single model — prompt improvement *and* storybook planning. JSON-capable.    |
 | Attention              | SageAttention                                            | Lossless ~30% Wan speedup on this hardware                                   |
@@ -32,7 +32,7 @@ so there are no circular imports:
 | `config.py`     | ComfyUI endpoints, on-disk paths, model filenames, tunables             |
 | `store.py`      | Atomic JSON load/save                                                    |
 | `models.py`     | Pydantic request models                                                  |
-| `workflows/wan.py`  | Wan 2.2 I2V workflow builder                                         |
+| `workflows/wan.py`  | Wan 2.2 I2V + VACE workflow builders                                 |
 | `workflows/flux.py` | Flux Kontext / Kontext-edit / Flux / SDXL / upscale builders        |
 | `comfy.py`      | ComfyUI submit-and-wait + ffmpeg media helpers (thumb, last-frame, probe, stitch) |
 | `state.py`      | `GenState`, the shared active-gen singleton, ComfyUI monitor + poll loops, history persistence |
@@ -203,17 +203,27 @@ user can:
 
 ### Phase B — Wan animation
 
-Scenes are animated **sequentially** so each can chain on the previous one. Per scene,
-Wan 2.2 14B I2V:
+Scenes are animated **sequentially** so each can chain on the previous one. The
+default route is **VACE** (`USE_VACE` in config): Wan 2.2 **T2V** experts with the
+Fun-VACE modules grafted on via the model loader's `vace_model` input (the wrapper
+rejects VACE on I2V bases by design). Per scene:
 
+- **Control frames** — `input_frames = [start, gray × (N−2), end]` with masks
+  `[keep, generate × (N−2), keep]` (VACE semantics: mask 0 = keep the frame,
+  mask 1 = generate). This reproduces FLF2V's start→end guidance exactly, so the
+  chaining/crossfade machinery is unchanged.
+- **Identity reference** — `ref_images` = the page's composite ref (character model
+  sheet). VACE encodes it as an extra latent frame the model attends to on every
+  step, so the character stays on-model **during** motion — the exact place plain
+  I2V drifts. `_build_wan_workflow` falls back to I2V if a page has no ref on disk.
 - `image` = the previous clip's **actual last rendered frame** (extracted with
-  `ffmpeg -sseof -1`), not the Kontext keyframe. Wan's FLF2V undershoots its end
+  `ffmpeg -sseof -1`), not the Kontext keyframe. Wan undershoots its end
   target, so chaining on the *rendered* frame is what makes the seam invisible by
   construction. (Page 1, and the page right after a location cut, start from their
   own keyframe.)
-- `end_image` = the page's end keyframe (every page runs **FLF2V**, start → end).
-  Wan I2V is strongly anchored to the start frame, so within a clip the background
-  largely holds even if the end keyframe's room drifts slightly.
+- `end_image` = the page's end keyframe (every page runs start → end guidance).
+  The animation is strongly anchored to the start frame, so within a clip the
+  background largely holds even if the end keyframe's room drifts slightly.
 - **Camera is forced static** (`Camera: locked, no movement`). Independent per-clip
   dolly/pan moves end at one framing and the next clip starts a different move from a
   different framing — a major source of seam pops — so they're stripped (the LLM's
@@ -319,9 +329,12 @@ The chain that produced kid-readable continuity, in order of impact:
 | `use_teacache` | `WanVideoTeaCache`       | Caches denoising deltas, ~1.5–2× speedup, minor cost    |
 | `sageattn`     | `attention_mode`         | SageAttention — lossless ~30% speedup                   |
 
-All wired into both the high-noise and low-noise samplers. Frame count is 81 for a
-full run (Wan 2.2's trained sweet spot for ~5 s); smoke mode drops to 33 frames /
-8 steps. `XFADE_DUR` (0.18 s) tunes the seam crossfade length.
+All wired into both the high-noise and low-noise samplers, in both the I2V and VACE
+builders. Frame count is 81 for a full run (Wan 2.2's trained sweet spot for ~5 s);
+smoke mode drops to 33 frames / 8 steps. `XFADE_DUR` (0.18 s) tunes the seam
+crossfade length. In the VACE builder, block swap also offloads the 15 VACE blocks
+per expert to cuda:1 (`vace_blocks_to_swap`), keeping VRAM headroom on par with the
+tuned I2V configuration despite the extra 3.1 GB module per expert.
 
 ## LLM behavior
 
