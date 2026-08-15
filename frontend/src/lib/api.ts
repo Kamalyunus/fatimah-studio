@@ -41,6 +41,7 @@ export const api = {
           drift?: number | null;
           drift_flagged?: boolean | null;
         }>;
+        animatic?: string;
         elapsed_s: number;
       };
       last_error: string | null;

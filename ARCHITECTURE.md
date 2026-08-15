@@ -16,7 +16,9 @@ on a dual-3090 home rig.
 | LLM                    | Ollama: `qwen3.6:latest` (Qwen3.5-MoE 36B, Q4_K_M)       | Single model — prompt improvement *and* storybook planning. JSON-capable.    |
 | Attention              | SageAttention                                            | Lossless ~30% Wan speedup on this hardware                                   |
 | CLIP-vision            | `openai/clip-vit-base-patch32` (CPU)                     | Cheap drift scoring against the protagonist's canonical reference            |
-| Stitching              | ffmpeg                                                   | Crossfade concat of silent Wan clips (chained on each clip's real last frame) |
+| Narration              | Kokoro-82M (CPU)                                         | Warm read-aloud voice; its length sets each page's clip length               |
+| Interpolation          | RIFE (ComfyUI-Frame-Interpolation)                       | 16fps -> 32fps per clip, delivered at 24fps — kills the "AI clip" judder     |
+| Stitching              | ffmpeg                                                   | Hard cuts within a location, dissolves at location changes; grade + grain    |
 | Upscale                | 4x-UltraSharp                                            | Solid photographic upscaler with low artifacts                               |
 | Remote access          | NordVPN Meshnet                                          | Peer-to-peer, no public IP exposure                                          |
 | LAN discovery          | avahi-daemon (mDNS)                                      | `fatimahstudio.local` resolves on the local network                          |
@@ -33,7 +35,11 @@ so there are no circular imports:
 | `store.py`      | Atomic JSON load/save                                                    |
 | `models.py`     | Pydantic request models                                                  |
 | `workflows/wan.py`  | Wan 2.2 I2V + VACE workflow builders                                 |
-| `workflows/flux.py` | Flux Kontext / Kontext-edit / Flux / SDXL / upscale builders        |
+| `workflows/flux.py` | Flux Kontext (optional character LoRA) / Flux / SDXL / upscale builders |
+| `workflows/video_post.py` | RIFE frame-interpolation workflow                              |
+| `tts.py`        | Kokoro-82M narration synthesis (CPU)                                    |
+| `takes.py`      | Draft-take scoring and selection                                        |
+| `finishing.py`  | Animatic, clip conforming, grade, grain, narration/music mix (ffmpeg)   |
 | `comfy.py`      | ComfyUI submit-and-wait + ffmpeg media helpers (thumb, last-frame, probe, stitch) |
 | `state.py`      | `GenState`, the shared active-gen singleton, ComfyUI monitor + poll loops, history persistence |
 | `storybook.py`  | The `_run_storybook` orchestrator + keyframe/regen/restitch/drift helpers |
@@ -130,6 +136,21 @@ Two-pass with a critique pass:
 If a saved character is in play, the planner is told to lock that character verbatim
 as `characters[0]` with role='protagonist'.
 
+### Phase 0-narration — The voice track, first
+
+The planner writes a `narration` line per scene (12-18 words of actual picture-book
+prose, not a description of the picture), and Kokoro renders each one to a WAV on the
+CPU before any image or video work starts. Each page's on-screen length is then
+`lead-in + spoken length + tail`, and its Wan frame count is that duration snapped to
+Wan's 4n+1 requirement and clamped to `[49, 97]` frames.
+
+This inversion is the point: film is cut to the voice, not the other way round. It is
+also what stops every page being a uniform five seconds regardless of how much story it
+carries. Pages whose line runs long are covered by a gentle retime at stitch time (up to
+1.45x, then a held frame) rather than by generating more frames, because Wan degrades
+past ~97 frames while a 20% slow-down on storybook motion is invisible — especially
+after interpolation.
+
 ### Phase 0a — Character casting
 
 One Flux model-sheet T2I per supporting character (neutral pose, plain background)
@@ -190,6 +211,17 @@ For each scene, in order:
    motion timeline, camera, objects, and assembled Wan prompt are stashed on the
    active `GenState` for later use.
 
+### Phase A-animatic — The whole film, before the film
+
+Once every keyframe exists, the stills are cut against the narration track into
+`animatic_<gen_id>.mp4` — the entire story, timed exactly as the finished film will be,
+for the cost of one ffmpeg pass. It streams to the UI while the slow animation phase
+runs, so there is something real to watch and judge during the wait, and a story that
+does not work is visible in minutes rather than hours.
+
+This is what the removed keyframe approval gate should have been. It does not block:
+the run continues into animation while you watch.
+
 ### Phase A1 — CLIP drift scoring
 
 CPU-side cosine similarity between the protagonist's canonical reference and every
@@ -213,7 +245,34 @@ frontend `ApprovalGate` component. Whole-run cancel is unaffected.)
 ### Phase B — Wan animation
 
 Scenes are animated **sequentially** so each can chain on the previous one. The
-default route is **I2V** (Wan 2.2 I2V experts, FLF2V start→end guidance). Per scene:
+default route is **I2V** (Wan 2.2 I2V experts, FLF2V start→end guidance).
+
+**Take selection.** Each page is first drafted `DRAFT_TAKES` times at half resolution
+and `DRAFT_STEPS` steps, varying only the seed, and the best draft's seed is used for
+the real render. This is the practice that most separates good generative video from
+mediocre generative video — the previous pipeline shipped the first take of every shot,
+which is nobody's idea of a workflow. The economics that make it affordable: a draft
+keeps the **full frame count** (motion is what we are choosing between) but drops
+resolution and steps, costing about a tenth of a final render, so best-of-3 adds ~40%
+to a run rather than tripling it.
+
+Takes are scored automatically by `takes.py`, combining:
+
+- **identity** (weight 0.50) — CLIP similarity between the clip's middle frame and the
+  protagonist's canonical reference. A drifted character is what viewers notice first.
+- **end match** (0.25) — CLIP similarity between the last frame and the intended end
+  keyframe: did the shot actually land its pose?
+- **motion sanity** (0.25) — mean absolute luma change between frames, scored against a
+  healthy band. Below the floor the clip is frozen; above the ceiling it is usually
+  morphing or flickering.
+
+The caveat worth remembering: a draft shares its **seed** with the final render but not
+its resolution or step count, so it predicts composition and gross motion well and fine
+detail poorly. We are picking a motion arc, not grading finished frames. Every take's
+scores and seed are persisted in `scenes_meta`, so a bad automatic pick can be
+overridden later via the per-scene regen flow.
+
+Per scene:
 
 - `image` = the previous clip's **actual last rendered frame** (extracted with
   `ffmpeg -sseof -1`), not the Kontext keyframe. Wan undershoots its end
@@ -251,13 +310,39 @@ experiment (control frames sampled every ~16 frames from a cheap I2V pre-pass).
 Quality flags on by default: `use_slg`, `use_feta`, `use_teacache`. SageAttention.
 Block swap to cuda:1.
 
-### Phase C — Stitch
+### Phase C — Finish and stitch
 
-`ffmpeg xfade` of the silent Wan clips with a short ~0.18 s crossfade per seam
-(`XFADE_DUR`). Because each clip already starts on the previous clip's real last
-frame, the boundary frames match; the crossfade just absorbs the residual
-motion-velocity discontinuity so the action eases across the cut instead of
-stop-starting. Output: `wan_studio_storybook_<gen_id>.mp4`.
+The finishing chain runs in a fixed order, and the order matters:
+
+1. **Interpolate** each clip 16 -> 32fps with RIFE, *before* stitching, so the
+   interpolator never smears across a cut. ~13s per clip on this hardware, no
+   re-rendering of anything. This is the single cheapest change that stops the output
+   reading as an AI clip rather than film.
+2. **Conform** each clip onto its narration length (retime up to 1.45x, then hold the
+   last frame). Wan renders whole frames, so a clip lands near its spoken duration but
+   rarely exactly on it, and unconformed drift would desync the voice page by page.
+3. **Grade**: measure every clip's average Y/U/V and nudge each toward the run's median
+   with one clamped `eq`/`colorbalance` pass, so separately-generated shots stop
+   disagreeing about exposure and white balance. Deliberately global and gentle — the
+   goal is consistency, not repainting.
+4. **Stitch with cut grammar**: a hard cut (one frame) within a location, a real
+   dissolve only where the location changes. Pages in a location are chained on the
+   previous clip's actual last frame, so their boundary frames already match and a hard
+   cut there is genuinely invisible — a dissolve would be *more* visible, not less.
+   A dissolve means "time or place changed", which is exactly and only what a location
+   cut is.
+5. **Grain + frame rate**: conform to 24fps and lay a little grain over the whole cut,
+   which breaks up the plasticky diffusion sheen. Applied last so it sits evenly across
+   the film instead of per shot.
+6. **Mix**: each page's narration is placed at its computed offset, optionally over a
+   ducked music bed (`sidechaincompress` keyed off the voice), then loudness-normalised
+   to EBU R128 (-16 LUFS).
+
+`finishing.narration_offsets` mirrors the stitcher's **per-seam** overlap — hard cuts
+overlap by one frame, dissolves by more — because using a single average would let the
+voice drift out of sync a little further with every page.
+
+Output: `wan_studio_storybook_<gen_id>.mp4`, 24fps with an AAC narration track.
 
 The history entry persists: the full plan, `scenes_meta` (every keyframe context,
 including the chained start frame), `locations_meta`, the protagonist's reference
@@ -272,6 +357,41 @@ completes unattended in a few minutes instead of hours. The backend logs each pa
 posts the job, watches `/api/state`, and extracts the frames either side of every
 seam into `output/smoke_seams_<id>/`. Purpose: validate page-to-page progression,
 the frame chaining, and the crossfade seams before committing to a full-length run.
+
+## Shot size and coverage
+
+Every page carries a `shot_size` of `wide` / `medium` / `close`, planned by the LLM with
+the rule that a new location opens wide (the viewer needs to learn the place), emotional
+and fine-detail beats go close, and the same size never runs more than twice in a row.
+
+The subtlety is that framing is normally **impossible to change**: page N+1's start
+frame is a byte-perfect copy of page N's end frame, and the end frame is an edit of its
+own start frame that is explicitly told to preserve the camera. That chain is what makes
+seams invisible — and it also means an entire location run is one locked-off shot, which
+is precisely the "samey" look.
+
+So when the planner asks for a different shot size, the chain is **deliberately broken**:
+the page renders a fresh start frame at the new framing (Kontext, anchored on the
+composite so the room is preserved), `framing_cut` is recorded, and the animation phase
+starts that page from its own keyframe rather than the previous clip's last frame. This
+is ordinary film coverage — cutting between shot sizes of the same scene is exactly what
+an editor does, and it does not need frame continuity to read correctly.
+
+## Character LoRAs
+
+`build_flux_kontext_workflow` accepts an optional `character_lora`, stacking a trained
+LoRA onto the Kontext path (model and CLIP both routed through `LoraLoader`). Reference
+conditioning alone holds a character across a handful of shots; a LoRA is what holds one
+across a whole film, and the two compose — the LoRA carries body and proportions while
+the reference keeps the particular scene on model. The current consensus stack is a
+light character LoRA plus per-shot reference conditioning, not one or the other.
+
+The wiring is in place and unit-verified (off by default; when set, the sampler and text
+encoder both route through the LoRA). **Training is not yet built.** ComfyUI ships native
+training nodes (`MakeTrainingDataset` -> `TrainLoraNode` -> `LoraSave`), and a finished
+storybook is itself a ready-made dataset — a dozen-plus renders of the same character —
+but a Flux LoRA training run costs hours on this hardware and has not been validated
+here, so it remains the next piece of work rather than a claim.
 
 ## Background continuity
 

@@ -74,6 +74,7 @@ export type GenStatus =
       character?: string;
       cast?: CastMember[];
       keyframes?: KeyframePreview[];
+      animatic?: string;   // timed keyframes+narration preview, ready before animation
     }
   | { phase: "done"; filename: string; durationS: number }
   | { phase: "error"; message: string }

@@ -28,6 +28,10 @@ export function OutputPanel() {
     (status.previewImages?.length ?? 0) > 0
       ? status.previewImages
       : null;
+  // Animatic: the whole story as stills cut to the narration, ready long before the
+  // animation finishes — so there's something real to watch (and judge) during the wait.
+  const animatic =
+    status.phase === "running" && status.kind === "storybook" ? status.animatic : undefined;
   const sceneDescs =
     status.phase === "running" ? status.sceneDescriptions ?? [] : [];
   const character =
@@ -84,6 +88,25 @@ export function OutputPanel() {
           <SaveCharacterPanel gen_id={result.id} default_name={character ?? ""} />
           <ScenesStrip entry={result} />
         </>
+      )}
+
+      {animatic && (
+        <div className="panel p-4 animate-fade-in space-y-2 border-brand/40">
+          <div className="text-sm font-semibold text-fg-base">
+            🎬 Story preview (with narration)
+          </div>
+          <div className="text-xs text-fg-muted">
+            The whole story, read aloud, timed exactly as the finished film will be — the
+            moving version is still rendering below.
+          </div>
+          <video
+            key={animatic}
+            src={api.videoUrl(animatic)}
+            controls
+            playsInline
+            className="w-full rounded-lg bg-black max-h-[50vh] object-contain"
+          />
+        </div>
       )}
 
       {storybookPreview && (

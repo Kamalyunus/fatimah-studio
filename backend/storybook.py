@@ -5,15 +5,25 @@ Mutates the shared singleton via `state.active_gen` so the routes can report pro
 drive the keyframe-approval gate."""
 from __future__ import annotations
 
+import asyncio
 import shutil
 import time
 from pathlib import Path
 from typing import Optional
 
 import drift
+import finishing
 import llm
 import state
-from comfy import _comfy_free, _extract_last_frame, _stitch_videos, _submit_comfy_and_wait
+import takes
+import tts
+from comfy import (
+    _comfy_free,
+    _extract_last_frame,
+    _probe_duration,
+    _stitch_videos,
+    _submit_comfy_and_wait,
+)
 from config import (
     CHARACTER_LIBRARY_DIR,
     CHARACTER_LIBRARY_FILE,
@@ -21,16 +31,29 @@ from config import (
     COMFY_OUTPUT,
     STORYBOOK_NEGATIVE,
     FLUX_KONTEXT_MODEL,
+    GRADE_ENABLED,
+    INTERP_ENABLED,
+    MUSIC_BED,
+    DRAFT_SCALE,
+    DRAFT_SEED_STRIDE,
+    DRAFT_STEPS,
+    DRAFT_TAKES,
     HISTORY_FILE,
+    MAX_VID_FRAMES,
+    MIN_VID_FRAMES,
+    NARRATION_DIR,
     SMOKE_PAGES,
     STORY_ASPECT_DIMS,
     STYLE_PREFIXES,
+    TAKES_ENABLED,
     USE_VACE,
+    VID_FPS,
 )
 from models import GenerateParams, ImageGenerateParams, StorybookParams
 from store import load_json, save_json
 from workflows import (
     build_flux_image_workflow,
+    build_interpolate_workflow,
     build_flux_kontext_workflow,
     build_wan22_i2v_workflow,
     build_wan22_vace_workflow,
@@ -122,6 +145,15 @@ def _composite_refs(
     combined.save(str(output_path), "PNG")
 
 
+# How each shot size is described to Flux. Concrete framing language, because "wide
+# shot" alone tends to be read as a style cue rather than a camera position.
+_SHOT_SIZE_CLAUSE = {
+    "wide": "a WIDE ESTABLISHING SHOT showing the whole room and",
+    "medium": "a MEDIUM SHOT, waist-up, with some of the room visible behind",
+    "close": "a CLOSE-UP filling the frame with",
+}
+
+
 def _build_wan_prompt(
     video_prompt: str,
     starting_pose: str,
@@ -207,10 +239,12 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         plan_pages = SMOKE_PAGES if smoke else p.n_pages
         kontext_steps = 10 if smoke else 20
         vid_steps = 8 if smoke else 20
-        vid_frames = 33 if smoke else 81
+        # Frame counts are derived per page from narration length below; smoke mode caps
+        # them hard so a validation run stays minutes rather than hours.
+        smoke_frame_cap = 33
         if smoke:
             print(f"[storybook] SMOKE MODE: pages={plan_pages} wan_steps={vid_steps} "
-                  f"wan_frames={vid_frames} kontext_steps={kontext_steps}")
+                  f"wan_frames<={smoke_frame_cap} kontext_steps={kontext_steps}")
 
         # 1) Use the LLM to plan (passing the saved character's canon, if any, so the
         # LLM treats it as locked rather than inventing a new protagonist).
@@ -238,6 +272,52 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
 
         # Free the LLM from VRAM before starting the long stream of Flux + Wan gens
         await llm.unload()
+
+        # =================== PHASE N — Narration (before any picture) ===================
+        # The voice track is authored first and each page's clip is then cut to fit its
+        # spoken line, the way an animatic is built. This is what stops every page being a
+        # uniform 5 seconds regardless of how much story it carries. Kokoro runs on CPU in
+        # a thread so the event loop (and the ComfyUI monitor) keeps ticking.
+        if state.active_gen is not None:
+            state.active_gen.node = "narration"
+        narration_dir = NARRATION_DIR / gen_id
+        narration_paths: list[Optional[Path]] = []
+        narration_durs: list[float] = []
+        for i, scene in enumerate(scenes):
+            line = tts.clean_narration(scene.get("narration") or "")
+            if not line:
+                # Planner dropped the field — fall back to the visual description so the
+                # page still gets a spoken beat rather than silence.
+                line = tts.clean_narration(scene.get("description") or "")
+            scene["narration"] = line
+            wav = narration_dir / f"page_{i:02d}.wav"
+            try:
+                dur = await asyncio.to_thread(tts.synth, line, wav)
+            except Exception as e:
+                print(f"[storybook] narration failed for page {i+1} ({e}) — page will be silent")
+                dur = 0.0
+            narration_paths.append(wav if dur > 0 else None)
+            narration_durs.append(dur)
+        spoken = sum(narration_durs)
+        print(f"[storybook] narration: {sum(1 for d in narration_durs if d > 0)}/{len(scenes)} "
+              f"pages voiced, {spoken:.1f}s total speech")
+
+        # Per-page on-screen length = lead-in + speech + tail, then the Wan frame count
+        # that best matches it (clamped to Wan's trained range).
+        page_durs = [
+            finishing.page_duration(d, fallback=MAX_VID_FRAMES / VID_FPS)
+            for d in narration_durs
+        ]
+        page_frames = [
+            finishing.frames_for_duration(d, VID_FPS, MIN_VID_FRAMES, MAX_VID_FRAMES)
+            for d in page_durs
+        ]
+        if smoke:
+            page_frames = [min(f, smoke_frame_cap) for f in page_frames]
+        print("[storybook] page timing: " + ", ".join(
+            f"p{i+1}={narration_durs[i]:.1f}s→{page_durs[i]:.1f}s/{page_frames[i]}f"
+            for i in range(len(scenes))
+        ))
 
         style_prefix = STYLE_PREFIXES.get(p.style.lower(), STYLE_PREFIXES["pixar"])
         width, height = STORY_ASPECT_DIMS.get(p.aspect, STORY_ASPECT_DIMS["landscape"])
@@ -360,11 +440,15 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         prev_end_image_filename: Optional[str] = None
         prev_objects: list[str] = []
         prev_scene_chars: list[str] = []
+        prev_shot_size: str = ""
         for i, scene in enumerate(scenes):
             scene_desc = scene.get("description") or "A scene from the story."
             starting_pose = scene.get("starting_pose") or ""
             ending_pose = scene.get("ending_pose") or ""
             intensity = (scene.get("motion_intensity") or "gentle").lower()
+            shot_size = (scene.get("shot_size") or "medium").lower()
+            if shot_size not in _SHOT_SIZE_CLAUSE:
+                shot_size = "medium"
             chars_in_scene = scene.get("characters_in_scene") or ([protagonist_name] if protagonist_name else [])
             # Location resolution: scene tags a location_id; we look up the canon and the
             # pre-generated ref. Fall back gracefully if the LLM emitted an unknown id.
@@ -417,7 +501,8 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 cast_clause = scene_canon if multi_char else (llm.render_canon(protagonist) or character)
                 start_prompt = (
                     f"{style_prefix}. {setting_clause}{cast_clause}. {scene_desc}. "
-                    f"{character} is {start_pose_text}."
+                    f"Framed as {_SHOT_SIZE_CLAUSE[shot_size]} {character}, "
+                    f"who is {start_pose_text}."
                 )
                 if saved_character:
                     # Saved-character flow: the saved ref IS the protagonist's canonical
@@ -515,6 +600,40 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 and (COMFY_INPUT / composite_ref_name).exists()
             )
 
+            # ---- Shot size: re-frame on a deliberate cut ----
+            # Pages normally inherit their start frame byte-for-byte from the previous
+            # page's end, which is what makes the seams invisible — but it also means the
+            # framing can never change, so a whole location run is one locked-off shot.
+            # That is the "samey" look. When the planner asks for a different shot size we
+            # deliberately break the chain and render a fresh start frame at the new
+            # framing: a cut between shot sizes of the same scene is ordinary film
+            # coverage, and the composite still anchors the room so the place is preserved.
+            framing_cut = False
+            if i > 0 and shot_size != prev_shot_size and use_kontext and not is_location_cut:
+                reframe_prompt = (
+                    f"Edit this image. Keep the exact same room, lighting, props, and every "
+                    f"character's appearance — only the framing changes. Re-frame as "
+                    f"{_SHOT_SIZE_CLAUSE[shot_size]} {character} {starting_pose or 'in their current pose'}. "
+                    f"{style_prefix}."
+                )
+                try:
+                    reframed = await _submit_comfy_and_wait(
+                        build_flux_kontext_workflow(
+                            prompt=reframe_prompt, width=width, height=height,
+                            seed=seed + i * 31 + 5, reference_image=composite_ref_name,
+                            steps=kontext_steps,
+                        ),
+                        timeout_s=300,
+                    )
+                    shutil.copyfile(str(COMFY_OUTPUT / reframed), str(COMFY_INPUT / start_image_input_name))
+                    page_thumb = reframed
+                    framing_cut = True
+                    if state.active_gen is not None and state.active_gen.preview_images:
+                        state.active_gen.preview_images[-1] = reframed
+                    print(f"[storybook] page {i+1}: reframe {prev_shot_size} → {shot_size}")
+                except Exception as e:
+                    print(f"[storybook] page {i+1} reframe failed ({e}) — keeping inherited framing")
+
             # ---- Keyframe routing: img2img background-lock vs from-scratch ----
             # EVERY page renders its own end keyframe so each page advances visually — a
             # storybook page is always a distinct beat even when its internal motion is
@@ -563,10 +682,11 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
             change_clause = ""
             if object_change and object_change.lower() != "none" and i > 0:
                 change_clause = f"During this scene: {object_change}. "
+            framing_clause = f"Framed as {_SHOT_SIZE_CLAUSE[shot_size]} the characters. "
             if multi_char:
                 end_prompt = (
                     f"{character} {end_pose_text}. "
-                    f"{scene_desc}. {style_prefix}. "
+                    f"{scene_desc}. {style_prefix}. {framing_clause}"
                     f"{setting_lock}"
                     f"{link_clause}"
                     f"{hold_clause}{change_clause}"
@@ -578,7 +698,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
             else:
                 end_prompt = (
                     f"{character} {end_pose_text}. "
-                    f"{scene_desc}. {style_prefix}. "
+                    f"{scene_desc}. {style_prefix}. {framing_clause}"
                     f"{setting_lock}"
                     f"{link_clause}"
                     f"{hold_clause}{change_clause}"
@@ -618,7 +738,8 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 )
                 end_prompt = (
                     f"Edit this image. Keep the exact same room, camera angle, lighting, "
-                    f"wall colors, furniture, and prop placement. {same_room_anchor}"
+                    f"wall colors, furniture, prop placement, and framing "
+                    f"(this stays {_SHOT_SIZE_CLAUSE[shot_size].split(',')[0]}). {same_room_anchor}"
                     f"Keep every character's appearance, clothing, and colors identical. "
                     f"Change only the poses and actions: {character} is now {end_pose_text}, "
                     f"clearly different from the current pose. {scene_desc}. "
@@ -654,6 +775,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
             prev_loc_id = loc_id
             prev_objects = list(objects_in_hand)
             prev_scene_chars = list(chars_in_scene)
+            prev_shot_size = shot_size
 
             # Cache per-scene context so the keyframe-regen endpoint can re-run this scene
             # individually, and so the Wan phase below has everything it needs without
@@ -672,6 +794,15 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                     "end_seed": end_seed,
                     "composite_ref": composite_ref_name,   # used by keyframe-regen + drift rescore
                     "end_ref": end_ref_name,               # the Kontext ref the END frame was actually built from
+                    # Narration-driven timing: the spoken line, its WAV, and the clip
+                    # length/frame count derived from it.
+                    "shot_size": shot_size,
+                    "framing_cut": framing_cut,
+                    "narration": scene.get("narration") or "",
+                    "narration_wav": str(narration_paths[i]) if narration_paths[i] else "",
+                    "narration_dur": narration_durs[i],
+                    "page_dur": page_durs[i],
+                    "frames": page_frames[i],
                     "bg_anchor_kind": bg_anchor_kind,      # "loc_ref" or "prev_end"
                     "characters_in_scene": list(chars_in_scene),
                     "location_id": loc_id,
@@ -712,11 +843,30 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         except Exception as e:
             print(f"[storybook] drift detection failed (non-fatal): {e}")
 
-        # The keyframe approval gate was removed: it paused every run waiting for a
-        # decision there was little to act on, and the keyframes now agree on layout by
-        # construction (Phase A start-frame edit). Runs go straight to Wan; the keyframe
-        # strip still streams into the UI as a live preview, and a finished storybook can
-        # still be fixed per-scene via /api/storybook/regenerate_scene.
+        # =================== ANIMATIC ===================
+        # Keyframes + narration, cut to the real page timings — the whole film as a timed
+        # slideshow, for the cost of an ffmpeg pass. This is the cheap preview that tells
+        # you whether the story and its pacing work before the hours of Wan work start.
+        # (The old keyframe approval gate was removed: it paused every run on a decision
+        # there was little to act on. This shows you the *movie* instead of loose frames,
+        # and it doesn't block — the run continues straight into animation.)
+        animatic_filename = f"animatic_{gen_id}.mp4"
+        try:
+            if state.active_gen is not None:
+                state.active_gen.node = "animatic"
+            kfs = state.active_gen.keyframes if state.active_gen else []
+            await finishing.build_animatic(
+                images=[COMFY_OUTPUT / kf["start_image"] for kf in kfs],
+                page_durs=[kf["page_dur"] for kf in kfs],
+                wavs=[Path(kf["narration_wav"]) if kf.get("narration_wav") else None for kf in kfs],
+                out=COMFY_OUTPUT / animatic_filename,
+            )
+            if state.active_gen is not None:
+                state.active_gen.animatic = animatic_filename
+            print(f"[storybook] animatic ready: {animatic_filename}")
+        except Exception as e:
+            print(f"[storybook] animatic build failed (non-fatal): {e}")
+            animatic_filename = ""
 
         # =================== PHASE B — Wan animations per scene ===================
         page_videos: list[str] = []
@@ -733,34 +883,91 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
 
             # A page re-anchored to the canonical location ref (bg_anchor_kind == "loc_ref")
             # past page 0 is a genuine location change → hard cut, don't chain frames.
+            # A framing cut is a deliberate change of shot size: the previous clip's last
+            # frame is in the OLD framing, so chaining onto it would undo the re-frame.
             is_location_cut = i > 0 and kf.get("bg_anchor_kind") == "loc_ref"
-            if prev_chain_frame and not is_location_cut and (COMFY_INPUT / prev_chain_frame).exists():
+            breaks_chain = is_location_cut or kf.get("framing_cut")
+            if prev_chain_frame and not breaks_chain and (COMFY_INPUT / prev_chain_frame).exists():
                 start_input = prev_chain_frame
             else:
                 start_input = kf["start_input_name"]
             kf["chain_start_input_name"] = start_input   # persisted so regen reuses the same start
 
-            i2v_params = GenerateParams(
-                prompt=kf["wan_prompt"],
-                negative=STORYBOOK_NEGATIVE,
-                width=width, height=height,
-                frames=vid_frames, steps=vid_steps,
-                cfg=6.0, shift=5.0, seed=seed,
-                fps=16, scheduler="unipc",
-                noise_aug=NOISE_AUG_BY_INTENSITY.get(kf["motion_intensity"], 0.05),
-                image=start_input,
-                end_image=kf["end_input_name"],
-                vace_ref_image=kf.get("composite_ref") or "",
-                multi_gpu=True,
-                attention_mode="sageattn",
-                block_swap_count=15, block_swap_device="cuda:1",
-                vae_tiling=False,
-                keep_t5_loaded=True,
-                use_slg=True, use_feta=True, use_teacache=True,
-            )
+            def _params_for(seed_value: int, w: int, h: int, steps: int) -> GenerateParams:
+                return GenerateParams(
+                    prompt=kf["wan_prompt"],
+                    negative=STORYBOOK_NEGATIVE,
+                    width=w, height=h,
+                    frames=kf["frames"], steps=steps,
+                    cfg=6.0, shift=5.0, seed=seed_value,
+                    fps=VID_FPS, scheduler="unipc",
+                    noise_aug=NOISE_AUG_BY_INTENSITY.get(kf["motion_intensity"], 0.05),
+                    image=start_input,
+                    end_image=kf["end_input_name"],
+                    vace_ref_image=kf.get("composite_ref") or "",
+                    multi_gpu=True,
+                    attention_mode="sageattn",
+                    block_swap_count=15, block_swap_device="cuda:1",
+                    vae_tiling=False,
+                    keep_t5_loaded=True,
+                    use_slg=True, use_feta=True, use_teacache=True,
+                )
+
+            # ---- Draft takes: render N cheap variants, keep the best one's seed ----
+            chosen_seed = seed
+            take_records: list[dict] = []
+            # Smoke runs still exercise the take path (with fewer takes) — a validation
+            # run that skips a whole stage isn't validating the pipeline.
+            n_takes = (min(2, DRAFT_TAKES) if smoke else DRAFT_TAKES) if TAKES_ENABLED else 1
+            if n_takes > 1:
+                if state.active_gen is not None:
+                    state.active_gen.node = f"page-{i+1}-takes"
+                dw = max(16, int(width * DRAFT_SCALE) // 16 * 16)
+                dh = max(16, int(height * DRAFT_SCALE) // 16 * 16)
+                drafts: list[takes.Take] = []
+                for k in range(n_takes):
+                    take_seed = seed + i * 7919 + k * DRAFT_SEED_STRIDE
+                    try:
+                        fn = await _submit_comfy_and_wait(
+                            _build_wan_workflow(_params_for(take_seed, dw, dh, DRAFT_STEPS)),
+                            timeout_s=1800,
+                        )
+                        drafts.append(takes.Take(index=k, seed=take_seed, filename=fn))
+                    except Exception as e:
+                        print(f"[storybook] page {i+1} draft {k+1} failed: {e}")
+                if drafts:
+                    try:
+                        await takes.score_takes(
+                            drafts,
+                            character_ref=(COMFY_INPUT / char_refs[protagonist_name]
+                                           if protagonist_name in char_refs else None),
+                            end_keyframe=COMFY_INPUT / kf["end_input_name"],
+                            work_dir=COMFY_OUTPUT / f"takes_{gen_id}" / f"p{i}",
+                        )
+                        best = takes.pick_best(drafts)
+                        chosen_seed = best.seed
+                        take_records = [t.to_dict() for t in drafts]
+                        summary = " | ".join(
+                            f"#{t.index+1} score={t.score:.3f}"
+                            f" id={t.identity:.2f}" if t.identity is not None else
+                            f"#{t.index+1} score={t.score:.3f}"
+                            for t in drafts
+                        )
+                        note = f" ({'; '.join(best.notes)})" if best.notes else ""
+                        print(f"[storybook] page {i+1} takes: {summary} → picked #{best.index+1}{note}")
+                    except Exception as e:
+                        print(f"[storybook] page {i+1} take scoring failed ({e}) — using first draft's seed")
+                        chosen_seed = drafts[0].seed
+            kf["takes"] = take_records
+            kf["chosen_seed"] = chosen_seed
+
+            if state.active_gen is not None:
+                state.active_gen.node = f"page-{i+1}-animate"
+            i2v_params = _params_for(chosen_seed, width, height, vid_steps)
             wf_v = _build_wan_workflow(i2v_params)
             print(f"[storybook] page {i+1} animate: "
-                  f"{'vace ref=' + i2v_params.vace_ref_image if 'vace_encode' in wf_v else 'i2v'}")
+                  f"{'vace ref=' + i2v_params.vace_ref_image if 'vace_encode' in wf_v else 'i2v'} "
+                  f"({kf['frames']}f for {kf['page_dur']:.1f}s, seed={chosen_seed})")
             vid_filename = await _submit_comfy_and_wait(wf_v, timeout_s=2400)
             page_videos.append(str(COMFY_OUTPUT / vid_filename))
             kf["video"] = vid_filename   # remembered so per-scene-regen (#3) can find it later
@@ -773,17 +980,106 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 prev_chain_frame = None   # fall back to the next page's own start keyframe
             step_done += 1
 
-        # --- Final stitch: short crossfade between clips. ---
-        # Each page starts from the previous clip's actual last frame, so adjacent boundary
-        # frames already match; the crossfade smooths the residual motion-velocity seam.
+        # --- Final stitch: conform to narration, crossfade, then lay the voice on top. ---
+        # Wan renders a whole number of frames, so each clip lands near its narration length
+        # but rarely exactly on it; conforming nudges each one onto its spoken duration
+        # before stitching, which is what keeps the voice in sync page after page.
         if state.active_gen is not None:
             state.active_gen.node = "stitching"
             state.active_gen.step = total
             state.active_gen.total_steps = total
 
+        kfs = state.active_gen.keyframes if state.active_gen else []
+
+        # 1) Interpolate each clip to a higher frame rate BEFORE stitching, so RIFE never
+        #    smears across a cut. Wan's native 16fps is the main reason its output reads
+        #    as an AI clip rather than film; this costs seconds per clip and no re-render.
+        smoothed: list[str] = []
+        for idx, vid in enumerate(page_videos):
+            if not INTERP_ENABLED:
+                smoothed.append(vid)
+                continue
+            try:
+                out_name = await _submit_comfy_and_wait(
+                    build_interpolate_workflow(vid, f"interp_p{idx}_{gen_id}"),
+                    timeout_s=900,
+                )
+                smoothed.append(str(COMFY_OUTPUT / out_name))
+            except Exception as e:
+                print(f"[storybook] interpolation failed for page {idx+1} ({e}) — using 16fps clip")
+                smoothed.append(vid)
+
+        # 2) Conform each clip onto its narration length (Wan renders whole frames, so a
+        #    clip lands near its spoken duration but rarely on it).
+        conformed: list[str] = []
+        achieved: list[float] = []
+        for idx, (vid, kf) in enumerate(zip(smoothed, kfs)):
+            target = kf.get("page_dur") or 0.0
+            if target <= 0:
+                conformed.append(vid)
+                achieved.append(_probe_duration(vid))
+                continue
+            dst = COMFY_OUTPUT / f"conformed_p{idx}_{gen_id}.mp4"
+            try:
+                achieved.append(await finishing.conform_clip(Path(vid), dst, target))
+                conformed.append(str(dst))
+            except Exception as e:
+                print(f"[storybook] conform failed for page {idx+1} ({e}) — using raw clip")
+                conformed.append(vid)
+                achieved.append(_probe_duration(vid))
+
+        # 3) Grade every shot toward the run's median exposure/white balance, so
+        #    separately-generated pages read as one piece of film.
+        if GRADE_ENABLED and len(conformed) > 1:
+            try:
+                levels = [await asyncio.to_thread(finishing._measure_levels, Path(c)) for c in conformed]
+                plans = finishing.plan_grade(levels)
+                graded_count = 0
+                for idx, (clip, filt) in enumerate(zip(conformed, plans)):
+                    if not filt:
+                        continue
+                    dst = COMFY_OUTPUT / f"graded_p{idx}_{gen_id}.mp4"
+                    await finishing.apply_grade(Path(clip), dst, filt)
+                    conformed[idx] = str(dst)
+                    graded_count += 1
+                print(f"[storybook] grade: {graded_count}/{len(conformed)} shots nudged toward the median look")
+            except Exception as e:
+                print(f"[storybook] grade failed (non-fatal): {e}")
+
+        # 4) Stitch, add grain + conform frame rate, then lay the mix on top.
+        # Cut grammar: a page that re-anchors to its canonical location ref is opening a
+        # NEW place, so it gets a dissolve; everything else hard-cuts, which is invisible
+        # because consecutive pages are chained on the previous clip's real last frame.
+        dissolve_at = {
+            idx for idx, kf in enumerate(kfs)
+            if idx > 0 and kf.get("bg_anchor_kind") == "loc_ref"
+        }
+        print(f"[storybook] cuts: {len(kfs) - 1 - len(dissolve_at)} hard, {len(dissolve_at)} dissolve")
+
         final_filename = f"wan_studio_storybook_{gen_id}.mp4"
         final_path = COMFY_OUTPUT / final_filename
-        await _stitch_videos(page_videos, str(final_path))
+        silent_path = COMFY_OUTPUT / f"silent_{gen_id}.mp4"
+        await _stitch_videos(conformed, str(silent_path), dissolve_at=dissolve_at)
+
+        picture_path = COMFY_OUTPUT / f"picture_{gen_id}.mp4"
+        try:
+            await finishing.finish_picture(silent_path, picture_path)
+        except Exception as e:
+            print(f"[storybook] picture finish failed ({e}) — using ungraded cut")
+            picture_path = silent_path
+
+        music = Path(MUSIC_BED) if MUSIC_BED and Path(MUSIC_BED).exists() else None
+        try:
+            await finishing.mux_mix(
+                video=picture_path,
+                wavs=[Path(kf["narration_wav"]) if kf.get("narration_wav") else None for kf in kfs],
+                offsets=finishing.narration_offsets(achieved, dissolve_at=dissolve_at),
+                out=final_path,
+                music=music,
+            )
+        except Exception as e:
+            print(f"[storybook] mix failed ({e}) — delivering silent cut")
+            shutil.copyfile(str(picture_path), str(final_path))
 
         # Save to history. We persist the full keyframe metadata so the per-scene
         # regenerate endpoint (#3) can re-animate a single scene later without
@@ -804,6 +1100,15 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 "description": kf["description"],
                 "composite_ref": kf.get("composite_ref"),
                 "end_ref": kf.get("end_ref", ""),
+                "shot_size": kf.get("shot_size", "medium"),
+                "framing_cut": kf.get("framing_cut", False),
+                "takes": kf.get("takes", []),
+                "chosen_seed": kf.get("chosen_seed", 0),
+                "narration": kf.get("narration", ""),
+                "narration_wav": kf.get("narration_wav", ""),
+                "narration_dur": kf.get("narration_dur", 0.0),
+                "page_dur": kf.get("page_dur", 0.0),
+                "frames": kf.get("frames", MAX_VID_FRAMES),
                 "characters_in_scene": kf.get("characters_in_scene", []),
                 "location_id": kf.get("location_id", ""),
                 "location_clause": kf.get("location_clause", ""),
@@ -835,6 +1140,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 "plan": plan,
                 "scenes_meta": scene_records,
                 "locations_meta": locations_records,
+                "animatic": animatic_filename,
                 "protagonist_name": protagonist_name,
                 "protagonist_ref_filename": char_refs.get(protagonist_name, ""),
                 "width": width,
@@ -886,16 +1192,47 @@ async def _rescore_drift_for_active() -> None:
 
 
 async def _restitch_storybook_from_history(entry: dict) -> str:
-    """Read scenes_meta from a history entry, concat the per-scene videos into the
-    final stitched MP4 (overwriting whatever was there). Returns the final filename."""
+    """Read scenes_meta from a history entry, conform each per-scene clip back onto its
+    narration length, stitch, and re-lay the voice track. Returns the final filename.
+
+    Mirrors the main run's finishing steps so a re-stitch after a single-scene regen
+    produces the same thing the original run did, narration included."""
     final_filename = entry["filename"]
-    scenes_meta = (entry.get("params") or {}).get("scenes_meta") or []
-    page_video_paths = [
-        str(COMFY_OUTPUT / s["video"]) for s in scenes_meta if s.get("video")
-    ]
-    if not page_video_paths:
+    gen_id = entry.get("id") or "restitch"
+    scenes_meta = [s for s in ((entry.get("params") or {}).get("scenes_meta") or []) if s.get("video")]
+    if not scenes_meta:
         raise RuntimeError("no per-scene videos found to stitch")
-    await _stitch_videos(page_video_paths, str(COMFY_OUTPUT / final_filename))
+
+    conformed: list[str] = []
+    achieved: list[float] = []
+    for idx, s in enumerate(scenes_meta):
+        src = COMFY_OUTPUT / s["video"]
+        target = float(s.get("page_dur") or 0.0)
+        if target <= 0:
+            conformed.append(str(src))
+            achieved.append(_probe_duration(str(src)))
+            continue
+        dst = COMFY_OUTPUT / f"conformed_p{idx}_{gen_id}.mp4"
+        try:
+            achieved.append(await finishing.conform_clip(src, dst, target))
+            conformed.append(str(dst))
+        except Exception as e:
+            print(f"[storybook] restitch conform failed for page {idx+1} ({e}) — using raw clip")
+            conformed.append(str(src))
+            achieved.append(_probe_duration(str(src)))
+
+    silent_path = COMFY_OUTPUT / f"silent_{gen_id}.mp4"
+    await _stitch_videos(conformed, str(silent_path))
+    wavs = [Path(s["narration_wav"]) if s.get("narration_wav") else None for s in scenes_meta]
+    try:
+        await finishing.mux_narration(
+            video=silent_path, wavs=wavs,
+            offsets=finishing.narration_offsets(achieved),
+            out=COMFY_OUTPUT / final_filename,
+        )
+    except Exception as e:
+        print(f"[storybook] restitch narration mux failed ({e}) — delivering silent cut")
+        shutil.copyfile(str(silent_path), str(COMFY_OUTPUT / final_filename))
     return final_filename
 
 
@@ -911,7 +1248,7 @@ async def _do_regenerate_scene(gen_id: str, scene_index: int, target: dict, para
             negative=STORYBOOK_NEGATIVE,
             width=int(params.get("width") or 1024),
             height=int(params.get("height") or 576),
-            frames=81, steps=20,
+            frames=int(target.get("frames") or MAX_VID_FRAMES), steps=20,
             cfg=6.0, shift=5.0,
             # Bump seed so the regen is actually different from the original
             seed=int(time.time() * 1000) % (2**31),

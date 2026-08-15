@@ -6,18 +6,35 @@ Kontext, and a local Ollama LLM. No cloud, no API keys, no per-generation cost;
 runs entirely on a home machine with dual NVIDIA GPUs.
 
 The headline feature is **Storybook Movie Maker**: type a one-line idea, and the
-studio plans a multi-scene picture book, illustrates each scene with consistent
-characters and locked backgrounds, animates every scene with cinematic motion, and
-stitches it all into a single silent MP4 you can watch on the couch.
+studio writes the story, records a warm narrator reading it, illustrates every page with
+consistent characters and locked backgrounds, animates each page, and cuts the whole
+thing to the voice track — delivering a narrated 24fps MP4 you can watch on the couch.
 
 > Built for my family. The UI is simple enough for kids; the pipeline underneath
 > is tuned for quality and character coherency.
 
 ## Highlights
 
-- **Storybook Movie Maker** — story → planned scenes (locations, characters, story
-  beats) → illustrated keyframes → animated clips with first/last frame guidance →
-  ffmpeg-stitched into one cinematic MP4. One unattended run, no gates.
+- **Storybook Movie Maker** — story → narration recorded first → planned scenes
+  (locations, characters, beats) → illustrated keyframes → animatic → best-of-N animated
+  takes → interpolated, graded and mixed into one narrated MP4. One unattended run.
+- **Narration-first timing** — the LLM writes real picture-book prose for each page, a
+  local voice reads it, and each page's clip length is cut to fit its line. The film is
+  cut to the voice, the way an animatic is, instead of every page being a flat 5 seconds.
+- **Animatic preview** — as soon as the keyframes exist, the stills are cut against the
+  narration into a watchable preview of the whole story. It appears in the UI minutes
+  in, while the hours-long animation phase is still running.
+- **Best-of-N takes** — every page is drafted several times at low cost and scored on
+  character identity, whether it lands the intended end pose, and motion sanity; only
+  the winning seed gets a full-quality render. Generating once and hoping is what made
+  the old output mediocre.
+- **Shot variety** — pages carry a wide / medium / close shot size; a change of framing
+  deliberately breaks the frame chain and re-frames the scene, which is what stops a
+  whole location playing as one locked-off take.
+- **Real finishing chain** — RIFE interpolation to 24fps, per-shot colour matching
+  toward the run's median look, film grain, hard cuts within a location and dissolves
+  only where the place changes, then a loudness-normalised mix (with optional ducked
+  music bed).
 - **Picture maker** — Flux schnell text-to-image and image-to-image at up to
   1280×768.
 - **Photo enhancer** — 4× upscale with 4x-UltraSharp.
@@ -120,7 +137,11 @@ studio/
 │   ├── comfy.py         ComfyUI submit + ffmpeg media helpers (thumb, stitch, …)
 │   ├── state.py         GenState + active-gen singleton + ComfyUI monitor loops
 │   ├── storybook.py     Storybook orchestrator (plan → keyframes → Wan → stitch)
-│   ├── workflows/       Workflow builders — wan.py (Wan I2V + VACE), flux.py (Flux/SDXL)
+│   ├── workflows/       Builders — wan.py (I2V+VACE), flux.py (Flux/SDXL), video_post.py (RIFE)
+│   ├── tts.py           Kokoro narration synthesis (CPU)
+│   ├── takes.py         Draft-take scoring + selection
+│   ├── finishing.py     Animatic, conform, grade, grain, narration/music mix
+│   ├── narration/       Per-page narration WAVs (auto-created)
 │   ├── llm/             Ollama package — prompts, client, render, planning
 │   ├── drift.py         CLIP-vision drift scoring (CPU)
 │   ├── smoke_test.py    Fast end-to-end smoke runner (smoke-mode storybook)
@@ -160,6 +181,10 @@ studio/
    - 4x-UltraSharp upscaler
 3. **Ollama** running on `127.0.0.1:11434` with:
    - `qwen3.6:latest` (~23 GB — used for prompt improvement *and* storybook planning)
+3b. **Narration + interpolation**:
+   - `kokoro` (pip, ~330 MB of weights on first use) for the narrator voice
+   - [ComfyUI-Frame-Interpolation](https://github.com/Fannovel16/ComfyUI-Frame-Interpolation)
+     for RIFE — the `rife47.pth` checkpoint downloads on first use
 4. **Python deps**: `fastapi`, `uvicorn`, `httpx`, `websockets`, `pydantic`,
    `pillow`, `transformers`, `torch`. (Living in `/home/yunus/Documents/comfyui/venv/`.)
 5. **System**: `ffmpeg`, `ffprobe`, `avahi-daemon` (for `fatimahstudio.local` mDNS).

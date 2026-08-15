@@ -18,11 +18,20 @@ from config import (
     UPSCALER_MODEL,
 )
 
-def build_flux_kontext_workflow(prompt: str, width: int, height: int, seed: int, reference_image: str, steps: int = 20) -> dict:
+def build_flux_kontext_workflow(
+    prompt: str, width: int, height: int, seed: int, reference_image: str,
+    steps: int = 20, character_lora: str = "", lora_strength: float = 0.8,
+) -> dict:
     """Flux Kontext: in-context generation conditioned on a reference image.
     Use a reference image of the character; prompt describes the new scene.
-    The character's appearance is preserved by the reference latents themselves."""
-    return {
+    The character's appearance is preserved by the reference latents themselves.
+
+    `character_lora` optionally stacks a trained character LoRA on top. Reference
+    conditioning alone holds a character across a handful of shots; a LoRA is what holds
+    one across a whole film, and the two compose — the LoRA carries the body/proportions
+    while the reference keeps this particular scene on model.
+    """
+    wf = {
         "unet": {
             "class_type": "UNETLoader",
             "inputs": {"unet_name": FLUX_KONTEXT_MODEL, "weight_dtype": "default"},
@@ -90,6 +99,18 @@ def build_flux_kontext_workflow(prompt: str, width: int, height: int, seed: int,
             "inputs": {"images": ["decode", 0], "filename_prefix": "wan_studio_image_flux"},
         },
     }
+    if character_lora:
+        wf["lora"] = {
+            "class_type": "LoraLoader",
+            "inputs": {
+                "model": ["unet", 0], "clip": ["clip", 0],
+                "lora_name": character_lora,
+                "strength_model": lora_strength, "strength_clip": lora_strength,
+            },
+        }
+        wf["sampler"]["inputs"]["model"] = ["lora", 0]
+        wf["positive"]["inputs"]["clip"] = ["lora", 1]
+    return wf
 
 
 def _append_upscale(wf: dict, image_ref: list, save_prefix: str, factor: int = 2) -> dict:

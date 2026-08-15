@@ -50,6 +50,10 @@ class GenState:
         #  start_prompt, end_prompt}
         # Mutable so the per-scene regen flow can update individual scenes in place.
         self.keyframes: list[dict] = []
+        # Filename of the animatic (keyframes cut to the narration track) once the
+        # keyframe phase finishes — a watchable preview of the whole film while the
+        # slow Wan animation runs.
+        self.animatic: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -79,6 +83,7 @@ class GenState:
                 }
                 for k in self.keyframes
             ],
+            "animatic": self.animatic,
             "elapsed_s": time.time() - self.started_at,
         }
 

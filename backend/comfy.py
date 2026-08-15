@@ -9,10 +9,15 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import httpx
 
-from config import COMFY_HTTP, XFADE_DUR
+from config import COMFY_HTTP, OUTPUT_FPS, XFADE_DUR
+
+# A "hard cut" is implemented as a one-frame xfade: visually a cut, but it keeps the
+# same offset arithmetic as a real dissolve so both kinds of seam share one code path.
+_HARD_CUT_DUR = 1.0 / OUTPUT_FPS
 
 
 def _generate_thumb(video_path: Path, thumb_path: Path) -> bool:
@@ -117,14 +122,16 @@ async def _submit_comfy_and_wait(workflow: dict, timeout_s: float = 600.0) -> st
                         return item["filename"]
 
 
-async def _stitch_videos(paths: list[str], output_path: str):
-    """Stitch silent Wan clips into one continuous video.
+async def _stitch_videos(paths: list[str], output_path: str, dissolve_at: Optional[set[int]] = None):
+    """Stitch clips into one continuous video, using film cut grammar.
 
-    Pages are chained on each clip's ACTUAL last rendered frame (see Phase B), so adjacent
-    boundary frames already match. On top of that we apply a short xfade between every pair
-    so the motion eases across the seam instead of stopping-and-restarting at each clip's
-    static keyframe. A genuine location change is a slightly bigger but still gentle
-    dissolve, which reads fine for a storybook."""
+    In editing, a hard cut means continuous action and a dissolve means time or place
+    changed. Pages within a location are chained on the previous clip's ACTUAL last
+    rendered frame, so their boundary frames already match — a hard cut there is
+    genuinely invisible and reads as one continuous shot, which a dissolve would not.
+    `dissolve_at` holds the indices of clips that open a NEW location; only those seams
+    get a crossfade, and a slower one, because that is the moment a dissolve is for.
+    """
     if not paths:
         raise ValueError("no paths to stitch")
 
@@ -133,14 +140,14 @@ async def _stitch_videos(paths: list[str], output_path: str):
         "-movflags", "+faststart", output_path,
     ]
 
-    # Single clip: nothing to crossfade, just transcode to the final container.
+    dissolve_at = dissolve_at or set()
+
+    # Single clip: nothing to join, just transcode to the final container.
     if len(paths) == 1:
         args = ["ffmpeg", "-y", "-i", paths[0], *common_out]
     else:
         durs = [_probe_duration(p) for p in paths]
-        # Clamp the fade so it can never exceed half of the shortest clip (avoids a
-        # negative xfade offset on unexpectedly short clips).
-        d = min(XFADE_DUR, min(durs) * 0.5)
+        shortest = min(durs)
 
         args = ["ffmpeg", "-y"]
         for p in paths:
@@ -148,13 +155,18 @@ async def _stitch_videos(paths: list[str], output_path: str):
 
         # xfade overlays each next clip onto the running stream; offset is measured in the
         # running stream's timeline. After folding in clip k the running length grows by
-        # (dur_k - d), so the next offset is (running_length - d).
+        # (dur_k - d), so the next offset is (running_length - d). A hard cut is simply
+        # xfade with a duration of one frame — it keeps the same arithmetic while being
+        # visually a cut.
         filters: list[str] = []
         prev_label = "0:v"
         running = durs[0]
         n = len(paths)
         for idx in range(1, n):
             out_label = "outv" if idx == n - 1 else f"x{idx}"
+            # Location change → a real (slower) dissolve. Same location → hard cut.
+            want = XFADE_DUR * 2.5 if idx in dissolve_at else _HARD_CUT_DUR
+            d = max(_HARD_CUT_DUR, min(want, shortest * 0.5))
             offset = running - d
             filters.append(
                 f"[{prev_label}][{idx}:v]xfade=transition=fade:"

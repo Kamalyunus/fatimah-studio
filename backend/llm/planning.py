@@ -86,7 +86,7 @@ async def plan_storybook(
         f"Illustration style: {style}\n\n"
         f"Every scene MUST include: location_id, starting_pose, ending_pose, prev_link, "
         f"description, motion, motion_timeline, camera, video_prompt, motion_intensity, "
-        f"characters_in_scene, objects_in_hand, object_change. The `locations` array is REQUIRED — enumerate every distinct "
+        f"characters_in_scene, objects_in_hand, object_change, narration, shot_size. The `locations` array is REQUIRED — enumerate every distinct "
         f"setting (typically 2-5 entries) and tag each scene with one of those ids. The "
         f"`characters` array is REQUIRED and contains the protagonist plus every supporting "
         f"character that appears; each character needs non-empty name/species/colors/features "
@@ -171,7 +171,10 @@ async def plan_storybook(
         "video_prompt":     "A soft warm storybook scene. Gentle, slow motion. Cinematic lighting that settles peacefully.",
         "motion_intensity": "gentle",
         "object_change":    "none",
+        "narration":        "",
+        "shot_size":        "medium",
     }
+    valid_shot_sizes = {"wide", "medium", "close"}
     valid_intensities = {"still", "gentle", "dynamic"}
     valid_cameras = {
         "static", "slow dolly in", "slow dolly out",
@@ -191,6 +194,13 @@ async def plan_storybook(
         # Normalise camera onto the small allowed set
         cam = (s.get("camera") or "static").strip().lower()
         s["camera"] = cam if cam in valid_cameras else "static"
+        # Normalise shot_size; anything unrecognised becomes a medium shot.
+        ss = (s.get("shot_size") or "medium").strip().lower()
+        for token in ("close", "wide", "medium"):
+            if token in ss:
+                ss = token
+                break
+        s["shot_size"] = ss if ss in valid_shot_sizes else "medium"
 
     # Normalise the characters array (also handles old-format saved-character locks).
     plan["characters"] = coerce_characters(plan)
@@ -355,6 +365,7 @@ async def _critique_plan(story: str, draft: dict, n_pages: int, style: str) -> d
         "starting_pose", "ending_pose", "prev_link", "description", "motion",
         "video_prompt", "motion_timeline", "camera", "motion_intensity",
         "location_id", "characters_in_scene", "objects_in_hand", "object_change",
+        "narration", "shot_size",
     )
     for idx, s in enumerate(new_scenes):
         if not isinstance(s, dict):

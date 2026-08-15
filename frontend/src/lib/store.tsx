@@ -229,6 +229,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         character: a.character,
         cast: a.cast,
         keyframes: a.keyframes,
+        animatic: a.animatic,
       };
     }
     if (result) {
