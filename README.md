@@ -7,9 +7,8 @@ runs entirely on a home machine with dual NVIDIA GPUs.
 
 The headline feature is **Storybook Movie Maker**: type a one-line idea, and the
 studio plans a multi-scene picture book, illustrates each scene with consistent
-characters and locked backgrounds, lets you approve the keyframes before any heavy
-work, animates every scene with cinematic motion, and stitches it all into a single
-silent MP4 you can watch on the couch.
+characters and locked backgrounds, animates every scene with cinematic motion, and
+stitches it all into a single silent MP4 you can watch on the couch.
 
 > Built for my family. The UI is simple enough for kids; the pipeline underneath
 > is tuned for quality and character coherency.
@@ -17,8 +16,8 @@ silent MP4 you can watch on the couch.
 ## Highlights
 
 - **Storybook Movie Maker** — story → planned scenes (locations, characters, story
-  beats) → illustrated keyframes → approval gate → animated clips with first/last
-  frame guidance → ffmpeg-stitched into one cinematic MP4.
+  beats) → illustrated keyframes → animated clips with first/last frame guidance →
+  ffmpeg-stitched into one cinematic MP4. One unattended run, no gates.
 - **Picture maker** — Flux schnell text-to-image and image-to-image at up to
   1280×768.
 - **Photo enhancer** — 4× upscale with 4x-UltraSharp.
@@ -26,12 +25,14 @@ silent MP4 you can watch on the couch.
   across all scenes; supporting characters get model-sheet refs; each clip starts
   from the *actual last rendered frame* of the previous clip so pose continuity is
   exact. CLIP-vision drift detection flags scenes where the character has drifted.
-- **VACE reference-conditioned animation** — each page animates on Wan 2.2 T2V
-  experts with grafted Fun-VACE modules: the start/end keyframes go in as masked
-  control frames (first/last-frame guidance preserved) and the page's character
-  sheet goes in as a VACE reference, so the model holds the character's identity
-  in **every generated frame**, not just at the keyframes. Falls back to plain
-  I2V if a page has no reference sheet.
+- **Layout-locked keyframes** — a page's end keyframe is generated as a Kontext
+  *edit of its own start frame* ("same room, same lighting, only the pose changes"),
+  so start and end agree on the room by construction and Wan never has to morph the
+  background mid-clip. From-scratch rendering is reserved for genuine location cuts
+  and pages where a new character enters.
+- **Cast lock during animation** — every Wan prompt states that only the characters
+  already visible may appear, backed by a storybook negative prompt that pushes hard
+  against extra people, crowds, and bystanders wandering through a shot.
 - **Background continuity** — locations are first-class entities. Each scene's
   Kontext keyframe is anchored on a consistent background panel (the location ref,
   or the previous scene's end frame for same-location runs), and the *animated*
@@ -46,22 +47,22 @@ silent MP4 you can watch on the couch.
   the LLM critique pass refuses plans where props appear from thin air.
 - **Character library** — save a protagonist from a finished storybook and re-use
   it as the locked main character of a future story.
-- **Per-scene regenerate** — re-roll a single keyframe at the approval gate, or
-  re-animate a single Wan scene after the storybook is done, without redoing
-  the rest.
-- **Fast smoke-test mode** — a `smoke` flag runs a short, low-step, auto-approved
-  3-page generation in a few minutes, so the coherency pipeline can be eyeballed
-  before committing to a full-length, full-quality run.
-- **Quality stack on by default** — Wan 2.2 14B MoE (two-expert chain, T2V+VACE
-  for storybooks) with Skip Layer Guidance, Enhance-A-Video, TeaCache, and
-  SageAttention.
+- **Per-scene regenerate** — re-animate a single Wan scene after the storybook is
+  done, without redoing the rest.
+- **Fast smoke-test mode** — a `smoke` flag runs a short, low-step 3-page
+  generation in a few minutes, so the coherency pipeline can be eyeballed before
+  committing to a full-length, full-quality run.
+- **Quality stack on by default** — Wan 2.2 14B MoE (two-expert I2V chain) with
+  Skip Layer Guidance, Enhance-A-Video, TeaCache, and SageAttention. (A VACE T2V
+  route ships behind the `USE_VACE` flag, off by default — it holds character
+  identity well but under-constrains the middle of each clip; see ARCHITECTURE.md.)
 - **Dual-GPU aware** — block-swap to a second GPU keeps each 24 GB card from
   running out of VRAM. LLM unloads from VRAM before diffusion starts.
 - **Local & private** — Ollama (`qwen3.6:latest` for everything LLM), no
   telemetry, no external calls.
 - **Friendly UI** — React + Tailwind, mobile-friendly, kid-readable. Avatar
-  picker for attribution. Live thumbnail strip during illustration and a full
-  approval gate before animation kicks off.
+  picker for attribution. Live thumbnail strip during illustration so you can watch
+  the story take shape.
 - **Remote access** — mDNS hostname for the LAN; NordVPN Meshnet for "from
   anywhere" without exposing anything to the public internet.
 
@@ -85,15 +86,15 @@ silent MP4 you can watch on the couch.
                         ▼                 ▼                          ▼
                 ┌──────────────┐  ┌──────────────┐         ┌──────────────────┐
                 │ ComfyUI 8188 │  │ Ollama 11434 │         │ CLIP-vit (CPU)   │
-                │ Wan2.2+VACE  │  │ qwen3.6      │         │ drift scoring    │
+                │ Wan 2.2 I2V  │  │ qwen3.6      │         │ drift scoring    │
                 │ Flux schnell │  │              │         │                  │
                 │ Flux Kontext │  │              │         │                  │
                 │ Upscaler     │  │              │         │                  │
                 └──────────────┘  └──────────────┘         └──────────────────┘
 ```
 
-For the deeper walkthrough of the storybook pipeline, the prev-end-as-Kontext-ref
-trick, the approval gate, and VRAM choreography, see
+For the deeper walkthrough of the storybook pipeline, the start-frame-edit keyframe
+trick, and VRAM choreography, see
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Hardware
@@ -134,7 +135,7 @@ studio/
     │   │   ├── StorybookPanel.tsx     story input → duration → submit
     │   │   ├── ImagePanel.tsx         create / modify
     │   │   ├── HomeScreen.tsx         landing tiles
-    │   │   ├── OutputPanel.tsx        result + thumbnail strip + approval gate UI
+    │   │   ├── OutputPanel.tsx        result + thumbnail strip + per-scene regen
     │   │   └── ProgressDisplay.tsx    friendly progress messaging
     │   ├── lib/{api,store,presets,user,utils}.ts
     │   └── types.ts
@@ -190,7 +191,7 @@ the `More Data` drive being mounted via fstab so the model weights are reachable
 ### Smoke test
 
 With the backend, ComfyUI, and Ollama all up, a fast end-to-end check (3 short pages,
-low steps, auto-approved — a few minutes instead of hours) validates the coherency
+low steps — a few minutes instead of hours) validates the coherency
 pipeline and drops seam frames for inspection:
 
 ```bash

@@ -11,7 +11,7 @@ on a dual-3090 home rig.
 | UI                     | React + Tailwind, static build served by the backend (:8000) | Snappy, mobile-friendly, kid-readable; one process, no separate dev server to run or reap |
 | Backend / orchestrator | FastAPI on 8000                                          | One service that builds workflow JSON and runs the storybook pipeline        |
 | Diffusion runtime      | ComfyUI on 8188                                          | Kijai's WanVideoWrapper + MultiGPU                                           |
-| Video model            | Wan 2.2 14B MoE + Fun-VACE modules on the T2V experts    | Reference-conditioned animation: FLF control frames + identity ref every frame (I2V kept as fallback) |
+| Video model            | Wan 2.2 14B MoE (I2V experts)                            | FLF2V start→end guidance; whole-clip anchoring to the start frame is what keeps rooms and cast stable. (A VACE T2V route exists behind `USE_VACE`, off by default — see Phase B.) |
 | Image model            | Flux schnell + Flux Kontext                              | Schnell is fast; Kontext locks character + setting via reference image       |
 | LLM                    | Ollama: `qwen3.6:latest` (Qwen3.5-MoE 36B, Q4_K_M)       | Single model — prompt improvement *and* storybook planning. JSON-capable.    |
 | Attention              | SageAttention                                            | Lossless ~30% Wan speedup on this hardware                                   |
@@ -50,9 +50,6 @@ The backend exposes a small, deliberately flat REST + WebSocket API. Notable end
 
 ```
 POST /api/storybook                      start a storybook generation
-POST /api/storybook/approve              user OK'd the keyframes → proceed to Wan
-POST /api/storybook/cancel_approval      user rejected the keyframes → abort
-POST /api/storybook/regenerate_keyframe  re-roll one Flux start/end frame mid-gate
 POST /api/storybook/regenerate_scene     re-animate one scene's Wan clip + restitch
 
 POST /api/image_generate    Flux/SDXL text-to-image or image-to-image
@@ -169,15 +166,25 @@ For each scene, in order:
      the established room).
    - The character panels lock each visible character's appearance.
 
-3. **END frame.** A from-scratch Flux Kontext render on that composite, prompted with
-   the pose change first, then setting-lock language, then `prev_link`, then the
-   object clause. Generating from empty noise (denoise 1.0) gives full freedom to
-   render *this* scene's pose/action — the load-bearing requirement, since a storybook
-   page is always a distinct beat. (An earlier experiment edited the start frame
-   img2img to pixel-lock the background, but at any denoise low enough to hold the room
-   it also reproduced the pose, and chaining each page off the previous output froze
-   whole same-location runs onto one frame. Background continuity is instead carried at
-   the Wan level — see Phase B chaining + start-frame anchoring.)
+3. **END frame.** The default route is a **Kontext instruction-edit of the page's own
+   start frame**: "keep the exact same room, camera, lighting, furniture, and character
+   appearance; change only the poses — {character} is now {ending_pose}". The start
+   frame is the ground truth for this scene's room and cast, so editing it makes the
+   start and end keyframes agree on layout *by construction* — Wan then only has to
+   move the character instead of morphing the background to land on an independently
+   imagined end frame. Because a beat can force a reframe (the action needs a part of
+   the room not visible in the start frame, e.g. the oven), the prompt also re-states
+   the location canon ("if the action requires showing a different part of the room,
+   it is still the exact same room: {loc_clause}") so newly revealed areas match the
+   established decor instead of a freshly invented room.
+   Fallback — from-scratch Kontext on the composite strip — is used when the start
+   frame can't serve as the reference: a **location cut** (the start frame shows the
+   old room) or a **new character entering** (their model-sheet panel has to introduce
+   them). The route is logged per page and stashed as `end_ref` so regen reuses the
+   same reference.
+   (Note this is *not* the earlier failed low-denoise img2img experiment: an
+   instruction edit changes the pose explicitly rather than relying on residual noise,
+   so it doesn't reproduce the pose or collapse same-location runs onto one frame.)
 
 4. **Cache.** Every scene's prompt, seed, composite ref name, keyframe filenames,
    motion timeline, camera, objects, and assembled Wan prompt are stashed on the
@@ -189,33 +196,25 @@ CPU-side cosine similarity between the protagonist's canonical reference and eve
 scene's start frame. Scenes scoring below `DRIFT_THRESHOLD = 0.82` get a
 `drift_flagged: true` on their keyframe entry for the UI to badge.
 
-### Phase A2 — Approval gate
+### Phase A2 — (removed) Approval gate
 
-The orchestrator sets `node = "awaiting-approval"` and awaits an
-`asyncio.Event`. The frontend renders the full keyframe strip with drift badges; the
-user can:
+Runs used to pause here with `node = "awaiting-approval"` until the user approved the
+keyframe strip or re-rolled individual frames. **Removed**: it stalled every run on a
+decision there was little to act on, and since the end keyframe is now an edit of its
+own start frame (Phase A), the start/end pairs agree on layout by construction, so
+there is far less to inspect. The keyframe strip still streams into the UI as a live
+preview while the run proceeds straight into Wan, and a finished storybook can still
+be fixed one scene at a time via `/api/storybook/regenerate_scene`.
 
-- Hit **approve** → proceed to Wan.
-- Hit **regenerate** on any keyframe → re-runs Flux Kontext with a new seed,
-  updates the cache in place, and re-scores drift. If the regen is an end-frame, it
-  propagates to the next scene's start to keep FLF2V chaining byte-perfect.
-- Hit **cancel** → abort cleanly without any Wan work.
+(Gone with it: `POST /api/storybook/approve`, `/cancel_approval`,
+`/regenerate_keyframe`, `GenState.approval_event` / `approval_cancelled`, and the
+frontend `ApprovalGate` component. Whole-run cancel is unaffected.)
 
 ### Phase B — Wan animation
 
 Scenes are animated **sequentially** so each can chain on the previous one. The
-default route is **VACE** (`USE_VACE` in config): Wan 2.2 **T2V** experts with the
-Fun-VACE modules grafted on via the model loader's `vace_model` input (the wrapper
-rejects VACE on I2V bases by design). Per scene:
+default route is **I2V** (Wan 2.2 I2V experts, FLF2V start→end guidance). Per scene:
 
-- **Control frames** — `input_frames = [start, gray × (N−2), end]` with masks
-  `[keep, generate × (N−2), keep]` (VACE semantics: mask 0 = keep the frame,
-  mask 1 = generate). This reproduces FLF2V's start→end guidance exactly, so the
-  chaining/crossfade machinery is unchanged.
-- **Identity reference** — `ref_images` = the page's composite ref (character model
-  sheet). VACE encodes it as an extra latent frame the model attends to on every
-  step, so the character stays on-model **during** motion — the exact place plain
-  I2V drifts. `_build_wan_workflow` falls back to I2V if a page has no ref on disk.
 - `image` = the previous clip's **actual last rendered frame** (extracted with
   `ffmpeg -sseof -1`), not the Kontext keyframe. Wan undershoots its end
   target, so chaining on the *rendered* frame is what makes the seam invisible by
@@ -231,7 +230,23 @@ rejects VACE on I2V bases by design). Per scene:
 - 81 frames @ 16 fps ≈ 5 s (Wan 2.2's trained sweet spot); smoke mode uses 33.
 - `noise_aug` is selected from `motion_intensity` (still 0.0, gentle 0.05, dynamic 0.10)
 - Wan prompt is the assembled string: video_prompt + pose chain + setting +
-  timeline + locked-camera + objects-held clause + "background remains stable" tail.
+  timeline + locked-camera + objects-held clause + a **cast lock** ("only the
+  characters already visible in the first frame appear; no one else enters or
+  leaves") + "background remains stable" tail. Clips render with
+  `STORYBOOK_NEGATIVE`, which extends the default negative prompt with extra-people
+  / crowd / bystander / person-entering terms — Wan otherwise likes to walk
+  strangers through the shot mid-clip.
+
+**VACE route (off by default, `USE_VACE` in config).** An alternative builder grafts
+the Fun-VACE modules onto the Wan 2.2 **T2V** experts (the wrapper rejects VACE on
+I2V bases) and reproduces FLF2V via masked control frames
+(`[start, gray × (N−2), end]`, mask 0 = keep / 1 = generate) plus the page's
+composite ref as an identity reference the model attends to on every step. It held
+character identity well, but with only two of 81 frames pinned the T2V base
+under-constrains the middle of each clip: extra people wander in, the room drifts,
+then the clip snaps back to the end keyframe — worse overall coherence than I2V's
+whole-clip start-frame anchoring. Left in the codebase for a future dense-control
+experiment (control frames sampled every ~16 frames from a cheap I2V pre-pass).
 
 Quality flags on by default: `use_slg`, `use_feta`, `use_teacache`. SageAttention.
 Block swap to cuda:1.
@@ -252,9 +267,8 @@ anything else.
 ### Smoke-test mode
 
 `StorybookParams.smoke = true` runs the *real* pipeline end to end but fast: capped
-to `SMOKE_PAGES` (3), Wan at 8 steps / 33 frames, Kontext at 10 steps, and the
-keyframe approval gate auto-approved so it completes unattended in a few minutes
-instead of hours. The backend logs each page's keyframe route, and `smoke_test.py`
+to `SMOKE_PAGES` (3), Wan at 8 steps / 33 frames, and Kontext at 10 steps, so it
+completes unattended in a few minutes instead of hours. The backend logs each page's keyframe route, and `smoke_test.py`
 posts the job, watches `/api/state`, and extracts the frames either side of every
 seam into `output/smoke_seams_<id>/`. Purpose: validate page-to-page progression,
 the frame chaining, and the crossfade seams before committing to a full-length run.
@@ -375,8 +389,7 @@ to skip the chain-of-thought block (faster, cleaner JSON).
 
 `POST /api/interrupt` calls ComfyUI's `/interrupt` and clears `_active_gen`. The
 storybook orchestrator wraps every long step in an "is cancelled?" check and exits
-cleanly without leaving half-rendered scenes in history. The approval gate also
-honours cancel via `cancel_approval`.
+cleanly without leaving half-rendered scenes in history.
 
 ## History
 
@@ -414,10 +427,9 @@ request via ffmpeg and cached as JPG in `studio/backend/thumbs/`.
   idle.
 - **Friendly progress messages.** `ProgressDisplay.tsx` translates internal node
   names (`page-3-image`, `page-3-animate`, `casting-Mochi`, `location-kitchen`,
-  `awaiting-approval`, `stitching`, …) into kid-readable strings.
-- **Approval gate UI.** When `node == "awaiting-approval"`, the output panel
-  switches to a strip of keyframe pairs with regen buttons and drift badges; the
-  user clicks Approve to release the Wan phase.
+  `stitching`, …) into kid-readable strings.
+- **Live keyframe strip.** As each page is illustrated its thumbnail streams into
+  the output panel, so the story is visible while the Wan phase runs.
 - **Avatar attribution.** A first-visit modal asks for a name + emoji; this is
   stored in `localStorage` and sent with every job.
 
@@ -436,5 +448,5 @@ needs Meshnet installed, but for a family use-case that's a feature.
 - No cloud storage. Everything is on the box. History caps at 200 entries; old
   artifacts are also pruned from the ComfyUI `output/` folder when the history
   entry rolls off.
-- No streaming previews of frames in flight. The keyframe approval gate gives the
+- No streaming previews of frames in flight. The per-page keyframe strip gives the
   user a *much* better preview than a streaming sampler thumbnail would.

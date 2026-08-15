@@ -44,16 +44,11 @@ class GenState:
         # The orchestrator populates this after the casting phase finishes.
         self.cast: list[dict] = []
 
-        # ----- Storybook keyframe preview gate (#2) -----
-        # When the orchestrator finishes generating all Flux start+end pairs, it sets
-        # node="awaiting-approval" and waits on `approval_event`. The frontend reads
-        # `keyframes` to show the strip, then POSTs /api/storybook/approve or /cancel.
-        self.approval_event: asyncio.Event = asyncio.Event()
-        self.approval_cancelled: bool = False
+        # ----- Storybook keyframe context -----
         # Per-scene context, populated during the Flux phase. Each entry:
         # {scene_index, start_image, end_image, description, motion_intensity, seed,
         #  start_prompt, end_prompt}
-        # Mutable so the regenerate endpoint can update individual scenes in place.
+        # Mutable so the per-scene regen flow can update individual scenes in place.
         self.keyframes: list[dict] = []
 
     def to_dict(self) -> dict:

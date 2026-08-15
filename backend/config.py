@@ -33,7 +33,11 @@ WAN22_I2V_LOW = "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
 # frames and the character sheet goes in as a reference image, so Wan maintains character
 # identity DURING animation instead of only at the keyframes. The VACE modules attach to
 # the Wan 2.2 *T2V* base experts (not I2V) via the model loader's vace_model input.
-USE_VACE = True                     # storybook Phase B routes to the VACE workflow
+# Disabled: with only first/last frames pinned, the T2V base under-constrains the
+# middle of each clip — extra people and background shifts appear mid-scene, then
+# snap back at the end keyframe. I2V (whole-clip anchoring to the start frame) is
+# more coherent for storybooks until VACE gets denser control frames.
+USE_VACE = False                    # storybook Phase B routes to the VACE workflow when True
 WAN22_T2V_HIGH = "Wan2_2-T2V-A14B_HIGH_fp8_e4m3fn_scaled_KJ.safetensors"
 WAN22_T2V_LOW = "Wan2_2-T2V-A14B-LOW_fp8_e4m3fn_scaled_KJ.safetensors"
 WAN22_VACE_HIGH = "Wan2_2_Fun_VACE_module_A14B_HIGH_fp8_e4m3fn_scaled_KJ.safetensors"
@@ -51,6 +55,13 @@ SDXL_LIGHTNING_LORA = "sdxl_lightning_4step_lora.safetensors"
 UPSCALER_MODEL = "4x-UltraSharp.pth"
 
 DEFAULT_NEGATIVE = "blurry, low quality, distorted, bad anatomy, watermark, text, jpeg artifacts, deformed, ugly"
+# Storybook Wan clips: the cast is fixed per scene, so push hard against Wan's habit of
+# walking extra people through the shot mid-clip.
+STORYBOOK_NEGATIVE = (
+    DEFAULT_NEGATIVE
+    + ", extra people, extra characters, crowd, bystanders, strangers, "
+    "new person entering the frame, people walking by in the background, duplicate character"
+)
 
 # ---------- Tunables ----------
 # Crossfade between stitched clips: ~3 frames @ 16fps — short enough to read as a smooth

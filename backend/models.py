@@ -125,11 +125,6 @@ class UseAsInputParams(BaseModel):
     filename: str   # filename in COMFY_OUTPUT to copy into COMFY_INPUT for re-use
 
 
-class RegenerateKeyframeParams(BaseModel):
-    scene_index: int
-    frame: str = Field("end", pattern="^(start|end)$")
-
-
 class RegenerateSceneParams(BaseModel):
     gen_id: str
     scene_index: int

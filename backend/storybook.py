@@ -19,7 +19,7 @@ from config import (
     CHARACTER_LIBRARY_FILE,
     COMFY_INPUT,
     COMFY_OUTPUT,
-    DEFAULT_NEGATIVE,
+    STORYBOOK_NEGATIVE,
     FLUX_KONTEXT_MODEL,
     HISTORY_FILE,
     SMOKE_PAGES,
@@ -171,6 +171,8 @@ def _build_wan_prompt(
     return (
         f"{video_prompt}{pose_chain}{setting}{timeline}{cam_clause}{obj_clause}{change_clause} "
         f"{character}. "
+        f"Only the characters already visible in the first frame appear in the shot; "
+        f"no one else enters or leaves the frame. "
         f"Storybook illustration style, {style} aesthetic, soft cinematic lighting, "
         f"smooth gentle motion, background remains stable and consistent throughout the shot."
     )
@@ -199,8 +201,8 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
 
         # Smoke-test knobs: a few short pages, low Wan steps/frames, low Kontext steps.
         # The dominant cost is Wan, so steps 20→8 and frames 81→33 give the biggest cut;
-        # n_pages is capped to keep at least one same-location beat (→ exercises the img2img
-        # background-lock) and ≥1 seam (→ exercises chaining + crossfade).
+        # n_pages is capped to keep at least one same-location beat (→ exercises the
+        # start-frame-edit end keyframe) and ≥1 seam (→ exercises chaining + crossfade).
         smoke = bool(getattr(p, "smoke", False))
         plan_pages = SMOKE_PAGES if smoke else p.n_pages
         kontext_steps = 10 if smoke else 20
@@ -208,7 +210,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         vid_frames = 33 if smoke else 81
         if smoke:
             print(f"[storybook] SMOKE MODE: pages={plan_pages} wan_steps={vid_steps} "
-                  f"wan_frames={vid_frames} kontext_steps={kontext_steps} (auto-approve on)")
+                  f"wan_frames={vid_frames} kontext_steps={kontext_steps}")
 
         # 1) Use the LLM to plan (passing the saved character's canon, if any, so the
         # LLM treats it as locked rather than inventing a new protagonist).
@@ -357,6 +359,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         loc_chain_len: int = 0
         prev_end_image_filename: Optional[str] = None
         prev_objects: list[str] = []
+        prev_scene_chars: list[str] = []
         for i, scene in enumerate(scenes):
             scene_desc = scene.get("description") or "A scene from the story."
             starting_pose = scene.get("starting_pose") or ""
@@ -584,23 +587,59 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                     f"pose, body position, and gesture are clearly different from the reference."
                 )
             end_seed = seed + i * 100 + 7
-            # From-scratch Kontext for every end keyframe. The composite reference already
-            # carries the background anchor (the location ref, or the previous scene's end
-            # frame for same-location continuity) plus the character panels, so Kontext keeps
-            # the room and the cast while having full freedom to render THIS scene's pose.
-            #
-            # (We tried an img2img edit of the start frame to pixel-lock the background, but
-            # at any denoise low enough to hold the room it also reproduced the pose — and
-            # chaining each page off the previous page's output made a same-location run
-            # converge to one frozen frame. Background continuity across clips is handled
-            # instead by frame-chaining in Phase B + Wan I2V anchoring to the start frame.)
-            if use_kontext:
-                _route = "kontext" + (" (location cut)" if is_location_cut else "")
+            # ---- End-keyframe route selection ----
+            # Preferred: Kontext *instruction-edit of the start frame itself*. The start
+            # frame is the ground truth for this scene's room, lighting, and cast, so
+            # editing it ("same room, only the pose changes") makes start/end agree on
+            # layout BY CONSTRUCTION — Wan then only has to move the character, instead
+            # of morphing the background to land on an independently-imagined end frame.
+            # (Distinct from the earlier failed low-denoise img2img attempt: an
+            # instruction edit changes the pose explicitly rather than relying on noise,
+            # so it doesn't converge to a frozen frame.)
+            # Fall back to the from-scratch composite route when the start frame can't
+            # serve as the reference: a location cut (start frame shows the OLD room) or
+            # a character entering who isn't in the start frame (the composite's model
+            # sheet has to introduce them).
+            new_chars = (set(chars_in_scene) - set(prev_scene_chars)) if i > 0 else set()
+            use_start_edit = (
+                kontext_available
+                and not is_location_cut
+                and not new_chars
+                and (COMFY_INPUT / start_image_input_name).exists()
+            )
+            if use_start_edit:
+                # If the beat forces a reframe (the action needs a part of the room that
+                # isn't in the start frame — e.g. the oven), Kontext will move the camera
+                # no matter what we say; the loc_clause anchor makes the newly-revealed
+                # part match the established room instead of a freshly-invented one.
+                same_room_anchor = (
+                    f"If the action requires showing a different part of the room, it is "
+                    f"still the exact same room: {loc_clause}. " if loc_clause else ""
+                )
+                end_prompt = (
+                    f"Edit this image. Keep the exact same room, camera angle, lighting, "
+                    f"wall colors, furniture, and prop placement. {same_room_anchor}"
+                    f"Keep every character's appearance, clothing, and colors identical. "
+                    f"Change only the poses and actions: {character} is now {end_pose_text}, "
+                    f"clearly different from the current pose. {scene_desc}. "
+                    f"{hold_clause}{change_clause}"
+                    f"Do not add any new people, characters, or objects; do not remove anyone."
+                )
+                end_ref_name = start_image_input_name
+                _route = "kontext (start-frame edit)"
+                wf_end = build_flux_kontext_workflow(
+                    prompt=end_prompt, width=width, height=height,
+                    seed=end_seed, reference_image=start_image_input_name, steps=kontext_steps,
+                )
+            elif use_kontext:
+                end_ref_name = composite_ref_name
+                _route = "kontext" + (" (location cut)" if is_location_cut else " (new character)")
                 wf_end = build_flux_kontext_workflow(
                     prompt=end_prompt, width=width, height=height,
                     seed=end_seed, reference_image=composite_ref_name, steps=kontext_steps,
                 )
             else:
+                end_ref_name = ""
                 _route = "plain-flux (no kontext)"
                 wf_end = build_flux_image_workflow(ImageGenerateParams(
                     image_mode="create", prompt=end_prompt,
@@ -614,6 +653,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
             # Bookkeeping for the next iteration's bg-anchor decision.
             prev_loc_id = loc_id
             prev_objects = list(objects_in_hand)
+            prev_scene_chars = list(chars_in_scene)
 
             # Cache per-scene context so the keyframe-regen endpoint can re-run this scene
             # individually, and so the Wan phase below has everything it needs without
@@ -631,6 +671,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                     "end_prompt": end_prompt,
                     "end_seed": end_seed,
                     "composite_ref": composite_ref_name,   # used by keyframe-regen + drift rescore
+                    "end_ref": end_ref_name,               # the Kontext ref the END frame was actually built from
                     "bg_anchor_kind": bg_anchor_kind,      # "loc_ref" or "prev_end"
                     "characters_in_scene": list(chars_in_scene),
                     "location_id": loc_id,
@@ -671,18 +712,11 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
         except Exception as e:
             print(f"[storybook] drift detection failed (non-fatal): {e}")
 
-        # =================== Approval gate ===================
-        # Smoke mode auto-approves so the run completes unattended.
-        if state.active_gen is not None and not smoke:
-            state.active_gen.node = "awaiting-approval"
-            state.active_gen.step = step_done
-            state.active_gen.approval_event.clear()
-            state.active_gen.approval_cancelled = False
-            await state.active_gen.approval_event.wait()
-            if state.active_gen is None or state.active_gen.approval_cancelled:
-                raise RuntimeError("storybook cancelled at preview")
-        elif smoke:
-            print("[storybook] SMOKE MODE: auto-approving keyframe gate, starting Wan phase")
+        # The keyframe approval gate was removed: it paused every run waiting for a
+        # decision there was little to act on, and the keyframes now agree on layout by
+        # construction (Phase A start-frame edit). Runs go straight to Wan; the keyframe
+        # strip still streams into the UI as a live preview, and a finished storybook can
+        # still be fixed per-scene via /api/storybook/regenerate_scene.
 
         # =================== PHASE B — Wan animations per scene ===================
         page_videos: list[str] = []
@@ -708,7 +742,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
 
             i2v_params = GenerateParams(
                 prompt=kf["wan_prompt"],
-                negative=DEFAULT_NEGATIVE,
+                negative=STORYBOOK_NEGATIVE,
                 width=width, height=height,
                 frames=vid_frames, steps=vid_steps,
                 cfg=6.0, shift=5.0, seed=seed,
@@ -769,6 +803,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 "motion_intensity": kf["motion_intensity"],
                 "description": kf["description"],
                 "composite_ref": kf.get("composite_ref"),
+                "end_ref": kf.get("end_ref", ""),
                 "characters_in_scene": kf.get("characters_in_scene", []),
                 "location_id": kf.get("location_id", ""),
                 "location_clause": kf.get("location_clause", ""),
@@ -873,7 +908,7 @@ async def _do_regenerate_scene(gen_id: str, scene_index: int, target: dict, para
         await llm.unload()
         i2v_params = GenerateParams(
             prompt=target["wan_prompt"],
-            negative=DEFAULT_NEGATIVE,
+            negative=STORYBOOK_NEGATIVE,
             width=int(params.get("width") or 1024),
             height=int(params.get("height") or 576),
             frames=81, steps=20,

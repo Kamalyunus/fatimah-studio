@@ -70,20 +70,6 @@ export const api = {
     return jsonOrThrow<{ prompt_id: string; gen_id: string; kind: string }>(r);
   },
 
-  async storybookApprove() {
-    return fetch(`${BASE}/storybook/approve`, { method: "POST" });
-  },
-  async storybookCancelApproval() {
-    return fetch(`${BASE}/storybook/cancel_approval`, { method: "POST" });
-  },
-  async storybookRegenKeyframe(scene_index: number, frame: "start" | "end") {
-    const r = await fetch(`${BASE}/storybook/regenerate_keyframe`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ scene_index, frame }),
-    });
-    return jsonOrThrow<{ ok: boolean; filename: string }>(r);
-  },
   async storybookRegenScene(gen_id: string, scene_index: number) {
     const r = await fetch(`${BASE}/storybook/regenerate_scene`, {
       method: "POST",

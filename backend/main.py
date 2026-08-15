@@ -41,7 +41,6 @@ from workflows import *         # noqa: F401,F403  — workflow builders
 from comfy import (
     _comfy_free,
     _generate_thumb,
-    _submit_comfy_and_wait,
 )
 from state import GenState
 from store import load_json, save_json
@@ -245,110 +244,6 @@ async def create_storybook(p: StorybookParams):
     asyncio.create_task(storybook._run_storybook(p, prompt_id, gen_id))
     return {"prompt_id": prompt_id, "gen_id": gen_id, "kind": "storybook"}
 
-
-
-@app.post("/api/storybook/approve")
-async def storybook_approve():
-    """Tell the orchestrator that the user is happy with the keyframes — proceed to Wan."""
-    if state.active_gen is None or state.active_gen.kind != "storybook":
-        raise HTTPException(409, "no storybook awaiting approval")
-    if state.active_gen.node != "awaiting-approval":
-        raise HTTPException(409, f"storybook is in '{state.active_gen.node}' state, not waiting for approval")
-    state.active_gen.approval_cancelled = False
-    state.active_gen.approval_event.set()
-    return {"ok": True}
-
-
-@app.post("/api/storybook/cancel_approval")
-async def storybook_cancel_approval():
-    """User rejected the keyframes; abort the storybook cleanly without running Wan."""
-    if state.active_gen is None or state.active_gen.kind != "storybook":
-        raise HTTPException(409, "no storybook awaiting approval")
-    if state.active_gen.node != "awaiting-approval":
-        raise HTTPException(409, f"storybook is in '{state.active_gen.node}' state, not waiting for approval")
-    state.active_gen.approval_cancelled = True
-    state.active_gen.approval_event.set()
-    return {"ok": True}
-
-
-
-@app.post("/api/storybook/regenerate_keyframe")
-async def storybook_regenerate_keyframe(p: RegenerateKeyframeParams):
-    """While the storybook is paused at the approval gate, re-run a single Flux frame
-    (start or end of scene N) with a fresh seed. Updates the keyframe cache in place
-    so the preview strip shows the new image. Wan has not started yet, so this is cheap."""
-    if state.active_gen is None or state.active_gen.kind != "storybook":
-        raise HTTPException(409, "no storybook awaiting approval")
-    if state.active_gen.node != "awaiting-approval":
-        raise HTTPException(409, "regen only allowed during keyframe approval")
-    keyframes = state.active_gen.keyframes
-    if not (0 <= p.scene_index < len(keyframes)):
-        raise HTTPException(400, "scene_index out of range")
-    if p.frame == "start" and p.scene_index > 0:
-        raise HTTPException(400, "page 2+ start frames are byte-perfect copies of the previous end; regen that end frame instead")
-
-    kf = keyframes[p.scene_index]
-    params = state.active_gen.params or {}
-    width = STORY_ASPECT_DIMS.get(params.get("aspect", "landscape"), STORY_ASPECT_DIMS["landscape"])[0]
-    height = STORY_ASPECT_DIMS.get(params.get("aspect", "landscape"), STORY_ASPECT_DIMS["landscape"])[1]
-    # Use the same composite reference this scene was originally generated with so the
-    # cast stays visually consistent on regen.
-    composite_ref = kf.get("composite_ref") or ""
-    kontext_available = (
-        composite_ref
-        and (Path("/media/yunus/More Data/comfyui-models/diffusion_models") / FLUX_KONTEXT_MODEL).exists()
-        and (COMFY_INPUT / composite_ref).exists()
-    )
-
-    new_seed = int(time.time() * 1000) % (2**31)
-    await _comfy_free()
-    if p.frame == "start":
-        prompt_text = kf.get("start_prompt") or ""
-        if not prompt_text:
-            raise HTTPException(409, "this start frame is from a saved character and cannot be regenerated")
-        wf = (
-            build_flux_kontext_workflow(
-                prompt=prompt_text, width=width, height=height,
-                seed=new_seed, reference_image=composite_ref, steps=20,
-            )
-            if kontext_available
-            else build_flux_image_workflow(ImageGenerateParams(
-                image_mode="create", prompt=prompt_text,
-                width=width, height=height, seed=new_seed, model="flux",
-            ))
-        )
-        out = await _submit_comfy_and_wait(wf, timeout_s=300)
-        shutil.copyfile(str(COMFY_OUTPUT / out), str(COMFY_INPUT / kf["start_input_name"]))
-        kf["start_image"] = out
-        if state.active_gen.preview_images:
-            state.active_gen.preview_images[0] = out
-        await storybook._rescore_drift_for_active()
-        return {"ok": True, "filename": out}
-    else:
-        prompt_text = kf["end_prompt"]
-        if kontext_available:
-            wf = build_flux_kontext_workflow(
-                prompt=prompt_text, width=width, height=height,
-                seed=new_seed, reference_image=composite_ref, steps=20,
-            )
-        else:
-            wf = build_flux_image_workflow(ImageGenerateParams(
-                image_mode="create", prompt=prompt_text,
-                width=width, height=height, seed=new_seed, model="flux",
-            ))
-        out = await _submit_comfy_and_wait(wf, timeout_s=300)
-        shutil.copyfile(str(COMFY_OUTPUT / out), str(COMFY_INPUT / kf["end_input_name"]))
-        kf["end_image"] = out
-        # If a later scene took this scene's end as its start, propagate the change so
-        # FLF2V chaining stays byte-perfect.
-        if p.scene_index + 1 < len(keyframes):
-            next_kf = keyframes[p.scene_index + 1]
-            shutil.copyfile(str(COMFY_OUTPUT / out), str(COMFY_INPUT / next_kf["start_input_name"]))
-            next_kf["start_image"] = out
-            if state.active_gen.preview_images and (p.scene_index + 1) < len(state.active_gen.preview_images):
-                state.active_gen.preview_images[p.scene_index + 1] = out
-        await storybook._rescore_drift_for_active()
-        return {"ok": True, "filename": out}
 
 
 

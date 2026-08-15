@@ -70,9 +70,8 @@ export function ProgressDisplay({ status, onCancel }: Props) {
 
     // Storybook macro-progress nodes
     const storybookMatch = node?.match(/^page-(\d+)-(image|animate)$/);
-    const awaitingApproval = node === "awaiting-approval";
     const isStorybookNode =
-      node === "planning" || node === "stitching" || !!storybookMatch || awaitingApproval;
+      node === "planning" || node === "stitching" || !!storybookMatch;
 
     let ratio: number;
     if (samplerActive) {
@@ -113,8 +112,6 @@ export function ProgressDisplay({ status, onCancel }: Props) {
       friendly = "Writing the story…";
     } else if (node === "stitching") {
       friendly = "Putting it all together…";
-    } else if (awaitingApproval) {
-      friendly = "Ready for you to review the keyframes ↓";
     } else if (storybookMatch) {
       const pageNum = parseInt(storybookMatch[1], 10);
       const kind = storybookMatch[2];
