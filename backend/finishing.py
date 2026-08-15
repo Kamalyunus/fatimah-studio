@@ -148,25 +148,49 @@ async def mux_narration(video: Path, wavs: list[Path | None], offsets: list[floa
     await _run_ffmpeg(args, "mux narration")
 
 
+# Fraction of a page the animatic spends on its opening frame before switching to the
+# frame the narration is actually describing.
+_ANIMATIC_LEAD_FRACTION = 0.35
+_ANIMATIC_LEAD_MAX = 1.4
+
+
 async def build_animatic(
     images: list[Path], page_durs: list[float],
     wavs: list[Path | None], out: Path,
+    end_images: Optional[list[Path]] = None,
 ) -> None:
     """Assemble keyframe stills + narration into a timed animatic.
 
     This is the cheap preview of the whole film — it costs seconds and tells you whether
     the story and its pacing work before committing hours to animation.
+
+    Each page shows its opening frame briefly and then its END frame for the rest of the
+    line. That ordering matters: a page's narration describes the beat it *arrives* at,
+    so the end keyframe is the picture that belongs with the words. Showing only the
+    opening frame puts every page's words over the previous page's picture — and drops
+    the final page's payoff image entirely.
     """
     if not images:
         raise ValueError("no images for animatic")
 
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
-        for img, dur in zip(images, page_durs):
-            fh.write(f"file '{Path(img).as_posix()}'\n")
-            fh.write(f"duration {dur:.4f}\n")
+        last_written = images[-1]
+        for idx, (img, dur) in enumerate(zip(images, page_durs)):
+            end_img = end_images[idx] if end_images and idx < len(end_images) else None
+            if end_img and Path(end_img).exists():
+                lead = min(_ANIMATIC_LEAD_MAX, dur * _ANIMATIC_LEAD_FRACTION)
+                fh.write(f"file '{Path(img).as_posix()}'\n")
+                fh.write(f"duration {lead:.4f}\n")
+                fh.write(f"file '{Path(end_img).as_posix()}'\n")
+                fh.write(f"duration {max(0.1, dur - lead):.4f}\n")
+                last_written = end_img
+            else:
+                fh.write(f"file '{Path(img).as_posix()}'\n")
+                fh.write(f"duration {dur:.4f}\n")
+                last_written = img
         # The concat demuxer ignores the final entry's duration unless the last file is
         # repeated, so repeat it.
-        fh.write(f"file '{Path(images[-1]).as_posix()}'\n")
+        fh.write(f"file '{Path(last_written).as_posix()}'\n")
         list_path = fh.name
 
     silent = out.with_suffix(".silent.mp4")

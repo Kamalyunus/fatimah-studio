@@ -652,6 +652,16 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
             # singular and plural phrasing so Flux doesn't invent extra characters in
             # protagonist-only scenes.
             end_pose_text = ending_pose or starting_pose or "in a settled, restful pose"
+            # The page's narration is the line the viewer hears over this page, and the end
+            # keyframe is the picture they are looking at when it lands. Feeding the line
+            # into the prompt is what stops the planner's ending_pose (often barely
+            # different from starting_pose) leaving the picture a beat behind the words.
+            narration_line = (scene.get("narration") or "").strip()
+            beat_clause = (
+                f'This page of the story reads: "{narration_line}" — the image must show '
+                f'that exact moment, already happening. '
+                if narration_line else ""
+            )
             proto_clause = llm.render_canon(protagonist) or (character or "")
             # The setting-lock language differs based on what the leftmost composite panel
             # is. When it's the previous scene's end frame, we tell Kontext to literally
@@ -689,6 +699,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                     f"{scene_desc}. {style_prefix}. {framing_clause}"
                     f"{setting_lock}"
                     f"{link_clause}"
+                    f"{beat_clause}"
                     f"{hold_clause}{change_clause}"
                     f"Protagonist (must match the reference exactly): {proto_clause}. "
                     f"Other characters present: {scene_canon}. "
@@ -701,6 +712,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                     f"{scene_desc}. {style_prefix}. {framing_clause}"
                     f"{setting_lock}"
                     f"{link_clause}"
+                    f"{beat_clause}"
                     f"{hold_clause}{change_clause}"
                     f"The character must match the reference exactly: {proto_clause}. "
                     f"The character's appearance is identical to the reference, but their "
@@ -743,6 +755,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                     f"Keep every character's appearance, clothing, and colors identical. "
                     f"Change only the poses and actions: {character} is now {end_pose_text}, "
                     f"clearly different from the current pose. {scene_desc}. "
+                    f"{beat_clause}"
                     f"{hold_clause}{change_clause}"
                     f"Do not add any new people, characters, or objects; do not remove anyone."
                 )
@@ -860,6 +873,7 @@ async def _run_storybook(p: StorybookParams, prompt_id: str, gen_id: str):
                 page_durs=[kf["page_dur"] for kf in kfs],
                 wavs=[Path(kf["narration_wav"]) if kf.get("narration_wav") else None for kf in kfs],
                 out=COMFY_OUTPUT / animatic_filename,
+                end_images=[COMFY_OUTPUT / kf["end_image"] for kf in kfs],
             )
             if state.active_gen is not None:
                 state.active_gen.animatic = animatic_filename
